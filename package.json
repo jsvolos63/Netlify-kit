@@ -1,0 +1,37 @@
+{
+  "name": "@jfs/netlify-kit",
+  "version": "0.1.0",
+  "description": "Shared, dependency-free Netlify Functions primitives (CORS + preflight, JSON/text/error responses, capped body reads, input validation, SSRF guards, retry-with-backoff fetch, per-IP rate limiting, and a createHandler boundary) extracted from the JFS family of buildless static sites.",
+  "type": "module",
+  "license": "MIT",
+  "author": "jsvolos63",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jsvolos63/netlify-kit.git"
+  },
+  "homepage": "https://github.com/jsvolos63/netlify-kit#readme",
+  "keywords": [
+    "netlify",
+    "netlify-functions",
+    "serverless",
+    "cors",
+    "ssrf",
+    "rate-limit",
+    "retry",
+    "validation"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js"
+  ],
+  "scripts": {
+    "test": "node test.mjs"
+  }
+}
