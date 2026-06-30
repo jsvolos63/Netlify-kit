@@ -1,124 +1,192 @@
-// @jfs/netlify-kit v0.1.0 — shared serverless-function primitives for the JFS
+// @jfs/netlify-kit v0.2.0 — shared serverless-function primitives for the JFS
 // family of buildless static sites deployed on Netlify.
 //
 // Every sibling app that ships Netlify Functions (market-monitor, Surf-Tracker,
-// FlightCheck, …) re-implements the same handful of cross-cutting concerns in
-// each function's `utils/` or `lib/` folder: CORS headers + preflight, JSON /
-// text / error response shaping, an SSRF guard for caller-supplied URLs, input
+// FlightCheck, …) re-implements the same cross-cutting concerns in each
+// function's `utils/` or `lib/` folder: CORS headers + preflight, JSON / text /
+// error response shaping, an SSRF guard for caller-supplied URLs, input
 // validation regexes, a retry-with-backoff fetch wrapper, a per-IP rate
 // limiter, and a try/catch handler boundary. Each copy drifts slightly — and
-// the differences are exactly the subtle correctness bugs (double-decoded `&`,
-// an unbounded `await res.text()`, a metadata-IP SSRF hole) that a single
+// the differences are exactly the subtle correctness bugs (a double-decoded
+// `&`, an unbounded `await res.text()`, a metadata-IP SSRF hole) that a single
 // tested implementation eliminates. This module is that single copy.
+//
+// COMPATIBILITY SUPERSET. The sibling apps grew slightly different signatures
+// for the same idea (market-monitor's `jsonResponse(body, cacheControl,
+// extraHeaders)` returns 200; Surf-Tracker's `jsonResponse(statusCode, obj,
+// opts)` takes an explicit status). To let every app adopt the kit by changing
+// only its import paths — not its call sites — `jsonResponse`/`textResponse`
+// detect the calling convention from their first argument (a number ⇒ the
+// status-first form, anything else ⇒ the body-first form). The behavior of each
+// form is byte-for-byte what its origin app already shipped, so the apps' test
+// suites pass unchanged.
 //
 // Pure ESM, dependency-free at install time. The one optional integration —
 // Netlify Blobs for distributed rate limiting — is reached through a dynamic
 // `import('@netlify/blobs')` that degrades to the in-memory limiter when the
-// package or a configured store isn't present, so nothing here forces a
-// dependency on consumers that don't use it.
+// package (or a configured store) isn't present.
 //
-// The canonical sources this consolidates:
+// Canonical sources this consolidates:
 //   - market-monitor/netlify/functions/utils/{cors,handler,validate,retry,
 //     ssrf,rate-limit,rate-limit-distributed}.js
 //   - Surf-Tracker/netlify/functions/lib/{http,ratelimit,url}.js
-//   - FlightCheck/netlify/functions/lib/http.js
-//
-// Sections: CORS · responses · validation · SSRF · retry · rate limiting ·
-// handler factory.
+//   - FlightCheck/netlify/functions/lib/http.js (response sugar)
 
 // ───────────────────────────── CORS ─────────────────────────────
-
+//
 // The cross-origin posture the family relies on: a `*` (or env-pinned) origin
-// for the GitHub-Pages / split-deploy setups, GET+POST+OPTIONS, a JSON
-// content-type on the request, and `nosniff`. `buildCorsHeaders` returns a
-// fresh object each call so a caller can mutate the result without poisoning a
-// shared singleton.
-export function buildCorsHeaders(opts = {}) {
-  const {
-    origin = process.env.CORS_ORIGIN || '*',
-    methods = 'GET, POST, OPTIONS',
-    headers = 'Content-Type',
-    maxAge,
-  } = opts;
-  const out = {
-    'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Methods': methods,
-    'Access-Control-Allow-Headers': headers,
-    'X-Content-Type-Options': 'nosniff',
-  };
-  if (maxAge != null) out['Access-Control-Max-Age'] = String(maxAge);
-  return out;
-}
+// for the split-deploy setups, GET+POST+OPTIONS, a JSON request content-type,
+// and `nosniff`.
+
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+
+export const corsHeaders = {
+  'Access-Control-Allow-Origin': CORS_ORIGIN,
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'X-Content-Type-Options': 'nosniff',
+};
 
 /** Returns a 204 preflight response for an OPTIONS request, or null otherwise.
- *  The 204 already carries the CORS headers, so callers can
- *  `const pf = handlePreflight(event); if (pf) return pf;`. */
-export function handlePreflight(event, opts = {}) {
+ *  The 204 already carries the CORS headers. (market-monitor form.) */
+export function handlePreflight(event) {
   if (event && event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: buildCorsHeaders(opts), body: '' };
+    return { statusCode: 204, headers: corsHeaders, body: '' };
   }
   return null;
 }
 
+/** Unconditional CORS preflight (204) with advertised verbs/headers — the
+ *  Surf-Tracker form, used when a handler answers OPTIONS itself rather than
+ *  delegating to `createHandler`. */
+export function preflightResponse(opts) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const methods = typeof o.methods === 'string' ? o.methods : 'GET, OPTIONS';
+  const allowHeaders = typeof o.allowHeaders === 'string' ? o.allowHeaders : 'content-type';
+  const maxAge = typeof o.maxAge === 'string' ? o.maxAge : '86400';
+  const corsOrigin = typeof o.corsOrigin === 'string' ? o.corsOrigin : '*';
+  return {
+    statusCode: 204,
+    headers: {
+      'access-control-allow-origin': corsOrigin,
+      'access-control-allow-methods': methods,
+      'access-control-allow-headers': allowHeaders,
+      'access-control-max-age': maxAge,
+    },
+    body: '',
+  };
+}
+
 // ─────────────────────────── responses ──────────────────────────
 
-const JSON_CT = 'application/json';
+export const JSON_HEADERS = { 'Content-Type': 'application/json', ...corsHeaders };
 
-/** Standard JSON response. `body` may be a JS value (stringified) or an
- *  already-serialised JSON string (passed through verbatim — skips a
- *  parse/stringify round-trip when relaying an upstream payload). Options:
- *  `{ statusCode=200, cacheControl, headers, cors }` where `cors` is either
- *  `true` (default headers), `false` (omit), or an options object forwarded to
- *  `buildCorsHeaders`. */
-export function jsonResponse(body, opts = {}) {
-  const { statusCode = 200, cacheControl, headers, cors = true } = opts;
-  const h = { 'Content-Type': JSON_CT };
-  if (cors) Object.assign(h, buildCorsHeaders(cors === true ? undefined : cors));
-  if (cacheControl) h['Cache-Control'] = cacheControl;
-  if (headers) Object.assign(h, headers);
+const JSON_CT_CHARSET = 'application/json; charset=utf-8';
+const TEXT_CT_CHARSET = 'text/plain; charset=utf-8';
+
+// market-monitor form: `jsonResponse(body, cacheControl?, extraHeaders?)` → 200.
+// `body` may be a JS value (stringified) or a pre-serialised JSON string.
+function bodyFirstJson(body, cacheControl, extraHeaders) {
+  const headers = { ...JSON_HEADERS };
+  if (cacheControl) headers['Cache-Control'] = cacheControl;
+  if (extraHeaders) Object.assign(headers, extraHeaders);
   return {
-    statusCode,
-    headers: h,
+    statusCode: 200,
+    headers,
     body: typeof body === 'string' ? body : JSON.stringify(body),
   };
 }
 
+// Surf-Tracker form: `jsonResponse(statusCode, obj, opts?)`.
+function statusFirstJson(statusCode, obj, opts) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const headers = o.headers && typeof o.headers === 'object' ? o.headers : {};
+  const cacheControl = typeof o.cacheControl === 'string' ? o.cacheControl : 'no-store';
+  const corsOrigin = typeof o.corsOrigin === 'string' ? o.corsOrigin : '*';
+  return {
+    statusCode,
+    headers: {
+      'content-type': JSON_CT_CHARSET,
+      'cache-control': cacheControl,
+      'access-control-allow-origin': corsOrigin,
+      ...headers,
+    },
+    body: JSON.stringify(obj),
+  };
+}
+
+/** JSON response. Two calling conventions, disambiguated by the first argument:
+ *   - `jsonResponse(body, cacheControl?, extraHeaders?)` → a 200 with the
+ *     family CORS + content-type headers (market-monitor form).
+ *   - `jsonResponse(statusCode, obj, opts?)` → an arbitrary-status JSON body
+ *     with `cache-control: no-store` by default (Surf-Tracker form). */
+export function jsonResponse(a, b, c) {
+  return typeof a === 'number' ? statusFirstJson(a, b, c) : bodyFirstJson(a, b, c);
+}
+
 /** Standard JSON error: `{ error }` body with CORS + content-type + nosniff.
- *  Use for every 4xx / 5xx that returns a JSON error. */
-export function errorResponse(statusCode, error, opts = {}) {
-  return jsonResponse({ error: String(error) }, { ...opts, statusCode });
+ *  `errorResponse(statusCode, error, extraHeaders?)` (market-monitor form). */
+export function errorResponse(statusCode, error, extraHeaders) {
+  return {
+    statusCode,
+    headers: extraHeaders ? { ...JSON_HEADERS, ...extraHeaders } : JSON_HEADERS,
+    body: JSON.stringify({ error }),
+  };
 }
 
-/** Plain-text response with the same CORS default as jsonResponse.
- *  `cache-control` is only emitted when a caller asks for one. */
-export function textResponse(body, opts = {}) {
-  const { statusCode = 200, cacheControl, headers, cors = true } = opts;
-  const h = { 'Content-Type': 'text/plain; charset=utf-8' };
-  if (cors) Object.assign(h, buildCorsHeaders(cors === true ? undefined : cors));
-  if (cacheControl) h['Cache-Control'] = cacheControl;
-  if (headers) Object.assign(h, headers);
-  return { statusCode, headers: h, body: body == null ? '' : String(body) };
+/** Plain-text response, `textResponse(statusCode, body, opts?)` (Surf-Tracker
+ *  form). `cache-control` is only emitted when a caller asks for one. */
+export function textResponse(statusCode, body, opts) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const headers = o.headers && typeof o.headers === 'object' ? o.headers : {};
+  const corsOrigin = typeof o.corsOrigin === 'string' ? o.corsOrigin : '*';
+  const out = {
+    'content-type': TEXT_CT_CHARSET,
+    'access-control-allow-origin': corsOrigin,
+    ...headers,
+  };
+  if (typeof o.cacheControl === 'string') out['cache-control'] = o.cacheControl;
+  return { statusCode, headers: out, body: body == null ? '' : String(body) };
 }
 
-/** Safe, bounded stringification of a thrown value for an error body/log, so a
- *  pathological `.message` can't bloat a response or a log line. */
+// FlightCheck response sugar — thin, named status shortcuts over the helpers
+// above. (FlightCheck additionally wants `cache-control: no-store` on every
+// function response; it passes that through its own thin wrapper.)
+export const ok = (body) => bodyFirstJson(body);
+export const badRequest = (error) => errorResponse(400, error);
+export const notFound = (error) => errorResponse(404, error);
+export const methodNotAllowed = (error = 'Method not allowed.') => errorResponse(405, error);
+export const serverError = (error) => errorResponse(500, error);
+export const badGateway = (error) => errorResponse(502, error);
+
+/** Relay an upstream error status, clamped to a valid 4xx/5xx range so an
+ *  unexpected upstream value never yields a malformed response. `extraHeaders`
+ *  forwards rate-limit hints (e.g. Retry-After). */
+export const upstreamError = (status, err, extraHeaders) => {
+  const safeStatus = Number.isInteger(status) && status >= 400 && status <= 599 ? status : 502;
+  return errorResponse(safeStatus, err, extraHeaders);
+};
+
+/** Safe, bounded stringification of a thrown value for an error body/log. */
 export function errorMessage(e, max = 200) {
   return String((e && e.message) || e).slice(0, max);
 }
 
-// Default upstream-body cap: 5 MB. Functions that fetch arbitrary upstreams
-// should guard against a hostile/runaway host streaming a multi-GB body into a
-// serverless function's memory.
+// Default upstream-body cap: 5 MB.
 export const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 
 /** Cheap pre-read guard: if an upstream advertises a `content-length` over the
  *  cap, return a 502 response object; otherwise null. content-length may be
- *  absent (chunked) — then this passes and `readTextCapped` is the backstop. */
-export function checkResponseSize(response, opts = {}) {
-  const { maxBytes = MAX_RESPONSE_BYTES, headers } = opts;
+ *  absent (chunked) — then this passes and `readTextCapped` is the backstop.
+ *  `checkResponseSize(response, headers?)` (market-monitor form). */
+export function checkResponseSize(response, headers) {
   const cl = response?.headers?.get?.('content-length');
-  if (cl && Number(cl) > maxBytes) {
-    return errorResponse(502, 'Upstream response too large', headers ? { headers } : undefined);
+  if (cl && Number(cl) > MAX_RESPONSE_BYTES) {
+    return {
+      statusCode: 502,
+      headers: headers || {},
+      body: JSON.stringify({ error: 'Upstream response too large' }),
+    };
   }
   return null;
 }
@@ -126,9 +194,8 @@ export function checkResponseSize(response, opts = {}) {
 /** Read a fetch Response body as UTF-8 text, refusing to buffer more than
  *  `maxBytes`. Streams the body and aborts the moment it exceeds the cap. A
  *  too-large body throws an Error tagged `.tooLarge = true` so callers can
- *  treat it as a hard, non-retryable failure. Decoding matches `Response.text()`
- *  (always UTF-8 per the Fetch standard). */
-export async function readTextCapped(res, maxBytes = MAX_RESPONSE_BYTES) {
+ *  treat it as a hard, non-retryable failure. */
+export async function readTextCapped(res, maxBytes) {
   const tooLarge = () => {
     const e = new Error('Upstream response too large');
     e.tooLarge = true;
@@ -137,7 +204,6 @@ export async function readTextCapped(res, maxBytes = MAX_RESPONSE_BYTES) {
   const len = Number(res.headers?.get?.('content-length'));
   if (Number.isFinite(len) && len > maxBytes) throw tooLarge();
 
-  // No readable stream (rare) — fall back to text(), still size-guarded.
   if (!res.body || typeof res.body.getReader !== 'function') {
     const text = await res.text();
     if (Buffer.byteLength(text, 'utf8') > maxBytes) throw tooLarge();
@@ -162,13 +228,10 @@ export async function readTextCapped(res, maxBytes = MAX_RESPONSE_BYTES) {
 
 // ────────────────────────── validation ──────────────────────────
 
-// Ticker symbols: A-Z, digits, dot, dash, colon, slash, caret, equals. Max 20
-// chars — covers BINANCE:BTCUSDT, BTC/USD, ^GSPC, 000001.SS.
+// Ticker symbols: A-Z, digits, dot, dash, colon, slash, caret, equals. Max 20.
 export const SYMBOL_RE = /^[A-Z0-9.\-:/^=]{1,20}$/;
-
-// FRED series IDs: uppercase letters, digits, underscore; max 30 chars.
+// FRED series IDs: uppercase letters, digits, underscore; max 30.
 export const FRED_ID_RE = /^[A-Z0-9_]{1,30}$/;
-
 // Unix timestamps: 1-11 digits.
 export const UNIX_TS_RE = /^\d{1,11}$/;
 
@@ -189,16 +252,14 @@ export function isValidTimestamp(str) {
 
 // ──────────────────────────── SSRF ──────────────────────────────
 //
-// For functions that fetch a caller-supplied URL and can't use a static host
-// allowlist (e.g. an article extractor that follows wherever a news item
-// links). Two layers: a string-level guard (HTTPS only, no IP literals, no
+// For functions that fetch a caller-supplied URL without a static host
+// allowlist. Two layers: a string-level guard (HTTPS only, no IP literals, no
 // internal suffixes) and a DNS-resolution guard that rejects any name pointing
 // at a private / link-local / loopback address (e.g. an attacker domain whose
 // A record is 169.254.169.254, the cloud-metadata endpoint). The pure IP
 // helpers are exported for unit testing.
 
-/** String-level guard. Returns `{ ok: true, url }` (a parsed URL) or
- *  `{ ok: false, error }`. */
+/** String-level guard. Returns `{ ok, url, error }`. */
 export function parseSafeHttpsUrl(input) {
   let url;
   try {
@@ -270,7 +331,6 @@ export function isPrivateIPv4(ip) {
 export function isPrivateIPv6(ip) {
   const a = String(ip).toLowerCase().split('%')[0]; // drop any zone id
   if (a === '::1' || a === '::') return true; // loopback / unspecified
-  // IPv4-mapped / -embedded (::ffff:1.2.3.4) — judge by the embedded v4.
   const v4 = a.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
   if (v4 && (a.startsWith('::ffff:') || a.startsWith('::'))) return isPrivateIPv4(v4[1]);
   const head = a.split(':')[0];
@@ -313,10 +373,8 @@ export async function resolveHostIsPublic(hostname) {
 // ──────────────────────────── retry ─────────────────────────────
 //
 // Bounded exponential backoff with full jitter around an async fetch. Retries
-// on thrown network errors and 502/503/504; 429 only when the caller opts in
-// (a free-tier 429 usually means "back off entirely", not "retry now"). Never
-// retries other 4xx (the request itself is bad) and never retries an
-// AbortError on the caller's signal.
+// thrown network errors and 502/503/504; 429 only when the caller opts in.
+// Never retries other 4xx, and never an AbortError on the caller's signal.
 
 export const RETRYABLE_STATUSES = new Set([502, 503, 504]);
 const DEFAULT_RETRIES = 2; // total attempts = retries + 1
@@ -347,222 +405,221 @@ export async function fetchWithRetry(url, init, opts) {
       const r = await fetchFn(url, init);
       const isRetryable = RETRYABLE_STATUSES.has(r.status) || (retryOn429 && r.status === 429);
       if (!isRetryable || attempt === retries) return r;
-      // Drain the body so the connection can be reused.
       try { await r.body?.cancel?.(); } catch { /* best effort */ }
     } catch (e) {
-      // An AbortError on the caller's signal must not be retried.
       if (e?.name === 'AbortError' || init?.signal?.aborted) throw e;
       lastErr = e;
       if (attempt === retries) throw e;
     }
     await sleepFn(fullJitter(attempt, baseMs, capMs, rng));
   }
-  // Unreachable — the loop always returns or throws.
   throw lastErr || new Error('fetchWithRetry: exhausted retries');
 }
 
 // ──────────────────────── rate limiting ─────────────────────────
 //
-// Best-effort, in-process, fixed-window limiter. Serverless instances are
-// ephemeral and several can be warm at once, so this caps burst abuse PER
-// INSTANCE rather than globally (ceiling N×max across N warm instances — still
-// a cap). Zero latency, zero storage, no cleanup debt; fails open by
-// construction. `createRateLimiter` returns an isolated limiter so distinct
-// endpoints keep independent buckets instead of sharing one module-global Map.
+// Two limiters the family uses, kept as their origin apps shipped them:
+//   • checkRateLimit / checkRateLimitDistributed — return a ready-to-return
+//     429 / 414 response object (or null). market-monitor's createHandler form.
+//   • rateLimit — a low-level fixed-window check returning { ok, retryAfter },
+//     letting a handler shape its own 429 (Surf-Tracker form).
+// Both are best-effort, in-process (per warm instance); the distributed variant
+// adds a Netlify Blobs bucket with transparent in-memory fallback.
 
 const IP_RE = /^(?:\d{1,3}\.){3}\d{1,3}$|^[0-9a-fA-F:]{2,39}$/;
+export const MAX_QUERY_LENGTH = 2048;
 
-/** Best client IP from a Netlify function event:
- *  `x-nf-client-connection-ip` (the real client IP Netlify sets) →
- *  first `x-forwarded-for` hop → `client-ip` → `'unknown'` (so a missing IP
- *  throttles as one shared group rather than escaping the limit). */
+// --- market-monitor: checkRateLimit (single shared Map, keyed by IP) ---
+
+const hits = new Map();
+const CLEANUP_INTERVAL = 120_000;
+let lastCleanup = Date.now();
+
+function cleanup(windowMs) {
+  const now = Date.now();
+  if (now - lastCleanup < CLEANUP_INTERVAL) return;
+  lastCleanup = now;
+  for (const [key, entry] of hits) {
+    if (now - entry.windowStart > windowMs * 2) hits.delete(key);
+  }
+}
+
+function allowRequest(ip, max = 60, windowMs = 60_000) {
+  cleanup(windowMs);
+  const now = Date.now();
+  const key = ip || 'unknown';
+  let entry = hits.get(key);
+  if (!entry || now - entry.windowStart > windowMs) {
+    entry = { count: 1, windowStart: now };
+    hits.set(key, entry);
+    return true;
+  }
+  entry.count++;
+  return entry.count <= max;
+}
+
+/** Returns a 429 / 414 response object if rate-limited or the query string is
+ *  oversized, or null if allowed. The response already carries CORS headers. */
+export function checkRateLimit(event, max = 60, windowMs = 60_000) {
+  const qs = event.rawQuery || event.rawQueryString || '';
+  if (typeof qs === 'string' && qs.length > MAX_QUERY_LENGTH) {
+    return {
+      statusCode: 414,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      body: JSON.stringify({ error: 'Query string too long' }),
+    };
+  }
+  let ip = event.headers?.['x-forwarded-for']?.split(',')[0]?.trim()
+         || event.headers?.['client-ip']
+         || 'unknown';
+  if (!IP_RE.test(ip)) ip = 'unknown';
+
+  if (!allowRequest(ip, max, windowMs)) {
+    return {
+      statusCode: 429,
+      headers: {
+        'Content-Type': 'application/json',
+        'Retry-After': String(Math.ceil(windowMs / 1000)),
+        ...corsHeaders,
+      },
+      body: JSON.stringify({ error: 'Too many requests' }),
+    };
+  }
+  return null;
+}
+
+// --- market-monitor: checkRateLimitDistributed (Netlify Blobs) ---
+
+let storePromise = null;
+function getRateStore() {
+  if (storePromise) return storePromise;
+  storePromise = (async () => {
+    try {
+      const { getStore } = await import('@netlify/blobs');
+      return getStore({ name: 'rate-limits', consistency: 'strong' });
+    } catch {
+      return null; // local dev / missing siteID — caller falls back to in-memory
+    }
+  })();
+  return storePromise;
+}
+
+function extractIp(event) {
+  let ip = event.headers?.['x-forwarded-for']?.split(',')[0]?.trim()
+        || event.headers?.['client-ip']
+        || 'unknown';
+  if (!IP_RE.test(ip)) ip = 'unknown';
+  return ip;
+}
+
+/** Async distributed rate-limit check. Returns a 429 / 414 response object, or
+ *  null if allowed. Falls back transparently to `checkRateLimit` when the
+ *  Blobs store is unavailable. */
+export async function checkRateLimitDistributed(event, max = 60, windowMs = 60_000) {
+  const qs = event.rawQuery || event.rawQueryString || '';
+  if (typeof qs === 'string' && qs.length > MAX_QUERY_LENGTH) {
+    return {
+      statusCode: 414,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      body: JSON.stringify({ error: 'Query string too long' }),
+    };
+  }
+
+  const store = await getRateStore();
+  if (!store) return checkRateLimit(event, max, windowMs);
+
+  const ip = extractIp(event);
+  const now = Date.now();
+  const windowStart = Math.floor(now / windowMs) * windowMs;
+  const key = `rl:${ip}:${windowStart}`;
+
+  let entry = null;
+  try {
+    entry = await store.get(key, { type: 'json' });
+  } catch {
+    return checkRateLimit(event, max, windowMs);
+  }
+
+  const count = (entry?.count || 0) + 1;
+  if (count > max) {
+    return {
+      statusCode: 429,
+      headers: {
+        'Content-Type': 'application/json',
+        'Retry-After': String(Math.ceil(windowMs / 1000)),
+        ...corsHeaders,
+      },
+      body: JSON.stringify({ error: 'Too many requests' }),
+    };
+  }
+  try {
+    await store.setJSON(key, { count, expiresAt: windowStart + windowMs * 2 });
+  } catch { /* better to permit than to error out */ }
+  return null;
+}
+
+/** Test seam: reset the cached Blobs store promise so tests can stub it. */
+export function _resetStoreCache() { storePromise = null; }
+
+// --- Surf-Tracker: rateLimit (per-name buckets, returns { ok, retryAfter }) ---
+
+const buckets = new Map();
+const MAX_KEYS = 5000;
+
+/** Best client IP from a Netlify event: `x-nf-client-connection-ip` (the real
+ *  client IP Netlify sets) → first `x-forwarded-for` hop → `client-ip` →
+ *  `'unknown'`. */
 export function clientIp(event) {
   const h = (event && event.headers) || {};
   const xff = typeof h['x-forwarded-for'] === 'string' ? h['x-forwarded-for'].split(',')[0].trim() : '';
-  const ip = h['x-nf-client-connection-ip'] || xff || h['client-ip'] || 'unknown';
-  return IP_RE.test(ip) ? ip : 'unknown';
+  return h['x-nf-client-connection-ip'] || xff || h['client-ip'] || 'unknown';
 }
 
-// Default cap on the raw query string — reject megabytes of unparseable garbage
-// before it ever reaches the parser / upstream.
-export const MAX_QUERY_LENGTH = 2048;
-
-/** Create an isolated in-memory rate limiter.
- *  `{ max=60, windowMs=60_000, maxKeys=5000, maxQueryLength=2048 }`.
- *  Returns `{ allow(ip), check(event, overrides), reset() }`:
- *   - `allow(ip)` → boolean (under the limit).
- *   - `check(event)` → a ready-to-return 429 / 414 response object, or null
- *     when allowed. Per-call `{ max, windowMs }` overrides are accepted. */
-export function createRateLimiter(config = {}) {
-  const {
-    max: defMax = 60,
-    windowMs: defWindow = 60_000,
-    maxKeys = 5000,
-    maxQueryLength = MAX_QUERY_LENGTH,
-    cors,
-  } = config;
-
-  const buckets = new Map(); // key → { windowStart, count }
-
-  function prune(now, windowMs) {
-    for (const [k, b] of buckets) {
-      if (now - b.windowStart >= windowMs) buckets.delete(k);
-    }
-    if (buckets.size > maxKeys) buckets.clear(); // last resort; only under-counts
+function pruneBuckets(now, windowMs) {
+  for (const [k, b] of buckets) {
+    if (now - b.windowStart >= windowMs) buckets.delete(k);
   }
-
-  function allow(ip, max = defMax, windowMs = defWindow, now = Date.now()) {
-    const key = ip || 'unknown';
-    let b = buckets.get(key);
-    if (!b || now - b.windowStart >= windowMs) {
-      b = { windowStart: now, count: 0 };
-      buckets.set(key, b);
-    }
-    b.count++;
-    if (buckets.size > maxKeys) prune(now, windowMs);
-    return b.count <= max;
-  }
-
-  function check(event, overrides = {}) {
-    const max = overrides.max ?? defMax;
-    const windowMs = overrides.windowMs ?? defWindow;
-    const corsOpt = overrides.cors ?? cors;
-    const jsonHeaders = (extra) => ({
-      'Content-Type': JSON_CT,
-      ...buildCorsHeaders(corsOpt === true || corsOpt == null ? undefined : corsOpt),
-      ...extra,
-    });
-
-    const qs = event?.rawQuery || event?.rawQueryString || '';
-    if (typeof qs === 'string' && qs.length > maxQueryLength) {
-      return { statusCode: 414, headers: jsonHeaders(), body: JSON.stringify({ error: 'Query string too long' }) };
-    }
-    if (!allow(clientIp(event), max, windowMs)) {
-      return {
-        statusCode: 429,
-        headers: jsonHeaders({ 'Retry-After': String(Math.ceil(windowMs / 1000)) }),
-        body: JSON.stringify({ error: 'Too many requests' }),
-      };
-    }
-    return null;
-  }
-
-  return { allow, check, reset: () => buckets.clear() };
+  if (buckets.size > MAX_KEYS) buckets.clear();
 }
 
-/** Distributed limiter backed by Netlify Blobs, for endpoints that benefit
- *  from cross-instance state. Read-modify-write can undercount by 1-2 hits per
- *  window under concurrency — acceptable for personal-dashboard thresholds.
- *  Degrades transparently to an in-memory fallback limiter when
- *  `@netlify/blobs` or a configured store is unavailable. Returns the same
- *  `{ check, reset }` shape as `createRateLimiter`, but `check` is async. */
-export function createDistributedRateLimiter(config = {}) {
-  const {
-    max: defMax = 60,
-    windowMs: defWindow = 60_000,
-    storeName = 'rate-limits',
-    maxQueryLength = MAX_QUERY_LENGTH,
-    cors,
-  } = config;
-
-  const fallback = createRateLimiter(config);
-  let storePromise = null;
-
-  function getStore() {
-    if (storePromise) return storePromise;
-    storePromise = (async () => {
-      try {
-        const { getStore } = await import('@netlify/blobs');
-        return getStore({ name: storeName, consistency: 'strong' });
-      } catch {
-        return null; // local dev / missing siteID → in-memory fallback
-      }
-    })();
-    return storePromise;
+/** Fixed-window check. Returns `{ ok: true }` under the limit, or
+ *  `{ ok: false, retryAfter }` (seconds) once `max` is exceeded within
+ *  `windowMs`. Fails open by construction. */
+export function rateLimit(event, { name, windowMs, max }, now = Date.now()) {
+  const key = `${name}:${clientIp(event)}`;
+  let b = buckets.get(key);
+  if (!b || now - b.windowStart >= windowMs) {
+    b = { windowStart: now, count: 0 };
+    buckets.set(key, b);
   }
-
-  async function check(event, overrides = {}) {
-    const max = overrides.max ?? defMax;
-    const windowMs = overrides.windowMs ?? defWindow;
-    const corsOpt = overrides.cors ?? cors;
-
-    const qs = event?.rawQuery || event?.rawQueryString || '';
-    if (typeof qs === 'string' && qs.length > maxQueryLength) {
-      return {
-        statusCode: 414,
-        headers: { 'Content-Type': JSON_CT, ...buildCorsHeaders(corsOpt === true || corsOpt == null ? undefined : corsOpt) },
-        body: JSON.stringify({ error: 'Query string too long' }),
-      };
-    }
-
-    const store = await getStore();
-    if (!store) return fallback.check(event, overrides);
-
-    const ip = clientIp(event);
-    const now = Date.now();
-    const windowStart = Math.floor(now / windowMs) * windowMs;
-    const key = `rl:${ip}:${windowStart}`;
-
-    let entry = null;
-    try {
-      entry = await store.get(key, { type: 'json' });
-    } catch {
-      return fallback.check(event, overrides); // read failure → degrade
-    }
-
-    const count = (entry?.count || 0) + 1;
-    if (count > max) {
-      return {
-        statusCode: 429,
-        headers: {
-          'Content-Type': JSON_CT,
-          'Retry-After': String(Math.ceil(windowMs / 1000)),
-          ...buildCorsHeaders(corsOpt === true || corsOpt == null ? undefined : corsOpt),
-        },
-        body: JSON.stringify({ error: 'Too many requests' }),
-      };
-    }
-    try {
-      await store.setJSON(key, { count, expiresAt: windowStart + windowMs * 2 });
-    } catch { /* better to permit than to error out */ }
-    return null;
+  b.count++;
+  if (buckets.size > MAX_KEYS) pruneBuckets(now, windowMs);
+  if (b.count > max) {
+    return { ok: false, retryAfter: Math.max(1, Math.ceil((b.windowStart + windowMs - now) / 1000)) };
   }
-
-  return { check, reset: () => { storePromise = null; fallback.reset(); }, _getStore: getStore };
+  return { ok: true };
 }
+
+/** Test-only reset of the per-name bucket state. */
+export function _resetRateLimit() { buckets.clear(); }
 
 // ─────────────────────── handler factory ────────────────────────
 //
 // Wraps the cross-cutting concerns every function needs — CORS preflight,
-// per-IP rate limiting, top-level try/catch + 500 fallback — so each function
-// focuses on the provider-specific bits.
-//
-//   export const handler = createHandler({
-//     name: 'quote',
-//     rateLimit: { max: 120, windowMs: 60_000 },
-//     handle: async (event) => {
-//       const { symbol } = event.queryStringParameters || {};
-//       if (!symbol) return errorResponse(400, 'Missing symbol');
-//       const r = await fetchWithRetry(upstream, { signal: AbortSignal.timeout(8000) });
-//       return jsonResponse(await r.json(), { cacheControl: 'no-store' });
-//     },
-//   });
+// per-IP rate limiting, top-level try/catch + 500 fallback.
 
 /** Build a Netlify function handler. Options:
- *   - `name`      — identifier used in the default error log.
- *   - `cors`      — options forwarded to `buildCorsHeaders` for the preflight.
- *   - `rateLimit` — `{ max, windowMs }` config (a private limiter is created),
- *                   OR a limiter instance `{ check }` (from `createRateLimiter`
- *                   / `createDistributedRateLimiter`), OR `null`/`false` to
- *                   disable. Default: 60 req / 60 s.
- *   - `handle`    — `async (event, context) => responseObject`. Required.
- *   - `onError`   — `async (error, event) => responseObject`. Optional; the
- *                   default logs and returns a 500. */
+ *   - `name`        — identifier used in the default error log.
+ *   - `rateLimit`   — `{ max, windowMs }` (default 60 / 60 s); `null`/`false`
+ *                     disables the limiter.
+ *   - `distributed` — when true, uses the Blobs-backed limiter.
+ *   - `handle`      — `async (event) => responseObject`. Required.
+ *   - `onError`     — `async (error, event) => responseObject`. Optional. */
 export function createHandler(options) {
   const {
     name = 'handler',
-    cors,
-    rateLimit = { max: 60, windowMs: 60_000 },
+    rateLimit: rateLimitOpt = { max: 60, windowMs: 60_000 },
+    distributed = false,
     handle,
     onError,
   } = options || {};
@@ -571,19 +628,19 @@ export function createHandler(options) {
     throw new Error('createHandler: handle option is required');
   }
 
-  let limiter = null;
-  if (rateLimit && typeof rateLimit.check === 'function') {
-    limiter = rateLimit; // a pre-built limiter instance
-  } else if (rateLimit !== null && rateLimit !== false) {
-    limiter = createRateLimiter({ ...rateLimit, cors });
-  }
+  const limiterEnabled = rateLimitOpt !== null && rateLimitOpt !== false;
+  const limit = limiterEnabled
+    ? (distributed
+        ? (event) => checkRateLimitDistributed(event, rateLimitOpt.max, rateLimitOpt.windowMs)
+        : (event) => checkRateLimit(event, rateLimitOpt.max, rateLimitOpt.windowMs))
+    : null;
 
   return async (event, context) => {
-    const preflight = handlePreflight(event, cors === true || cors == null ? undefined : cors);
+    const preflight = handlePreflight(event);
     if (preflight) return preflight;
 
-    if (limiter) {
-      const limited = await limiter.check(event);
+    if (limit) {
+      const limited = await limit(event);
       if (limited) return limited;
     }
 
@@ -594,12 +651,11 @@ export function createHandler(options) {
         try {
           return await onError(error, event);
         } catch (innerErr) {
-          // onError itself threw — fall through so we never leak it.
           console.error(`${name} onError threw:`, errorMessage(innerErr));
         }
       }
       console.error(`${name} error:`, errorMessage(error));
-      return errorResponse(500, 'Internal error', cors == null ? undefined : { cors });
+      return errorResponse(500, 'Internal error');
     }
   };
 }

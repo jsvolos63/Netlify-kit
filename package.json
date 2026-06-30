@@ -1,6 +1,6 @@
 {
   "name": "@jfs/netlify-kit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Shared, dependency-free Netlify Functions primitives (CORS + preflight, JSON/text/error responses, capped body reads, input validation, SSRF guards, retry-with-backoff fetch, per-IP rate limiting, and a createHandler boundary) extracted from the JFS family of buildless static sites.",
   "type": "module",
   "license": "MIT",
