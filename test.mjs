@@ -337,7 +337,9 @@ function fakeStore() {
   const m = new Map();
   return {
     get: async (k) => (m.has(k) ? m.get(k) : null),
-    setJSON: async (k, v) => { m.set(k, v); },
+    // Round-trip through JSON like the real Blobs store does, so undefined
+    // values are dropped exactly as they would be in production.
+    setJSON: async (k, v) => { m.set(k, JSON.parse(JSON.stringify(v))); },
     _map: m,
   };
 }
@@ -369,6 +371,22 @@ test('setTTLCached / getTTLCached: round-trip, TTL expiry, and null-store no-op'
   // A null store (Blobs unavailable) is a graceful no-op, never a throw.
   assert.equal(await getTTLCached(null, 'k', { ttlMs: 1000 }), null);
   assert.equal(await setTTLCached(null, 'k', { v: 2 }), false);
+});
+
+test('getTTLCached: undefined data reads back as null; falsy-but-real values round-trip', async () => {
+  const store = fakeStore();
+
+  // undefined data → JSON drops it → the entry is content-less. It must read as
+  // null (a miss), never undefined, so a `=== null` check can't mistake it.
+  await setTTLCached(store, 'u', undefined, { now: 1000 });
+  assert.deepEqual(store._map.get('u'), { at: 1000 }); // data key dropped by JSON
+  assert.equal(await getTTLCached(store, 'u', { ttlMs: 45_000, now: 1000 }), null);
+
+  // Genuine falsy values are real hits and must survive intact.
+  for (const [key, val] of [['n', null], ['f', false], ['z', 0], ['e', '']]) {
+    await setTTLCached(store, key, val, { now: 1000 });
+    assert.strictEqual(await getTTLCached(store, key, { ttlMs: 45_000, now: 1000 }), val);
+  }
 });
 
 test('getTTLCached: malformed entry and read failure resolve to null', async () => {

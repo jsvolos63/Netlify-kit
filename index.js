@@ -649,14 +649,19 @@ export function blobKey(...parts) {
 /** Read a TTL-stamped entry written by setTTLCached. Returns the stored `data`
  *  when present and — if `ttlMs` is given — fresher than it; otherwise null. A
  *  null store, malformed entry, or transient read failure all resolve to null
- *  so the caller fetches live. Omit `ttlMs` to read without expiry. */
+ *  so the caller fetches live. Omit `ttlMs` to read without expiry.
+ *
+ *  Note: an entry cached with `data: undefined` serializes to `{ at }` (JSON
+ *  drops undefined), so its data reads back as `undefined` — normalized to null
+ *  here so a `=== null` miss check can't mistake it for a real hit. Falsy-but-
+ *  real values (null, false, 0, '') round-trip intact. */
 export async function getTTLCached(store, key, { ttlMs, now = Date.now() } = {}) {
   if (!store) return null;
   try {
     const entry = await store.get(key, { type: 'json' });
     if (!entry || typeof entry.at !== 'number') return null;
     if (ttlMs != null && now - entry.at > ttlMs) return null;
-    return entry.data;
+    return entry.data === undefined ? null : entry.data;
   } catch {
     return null;
   }
