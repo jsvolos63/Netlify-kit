@@ -90,6 +90,22 @@ retries network errors + 502/503/504, 429 only with `retryOn429`; injectable
 - `rateLimit(event, { name, windowMs, max })` → `{ ok, retryAfter }` low-level
   check. `clientIp(event)`. `_resetRateLimit()` test seam.
 
+**Blobs cache** — a store opener + short-TTL cache, generalized from
+FlightCheck's `flightCache.js` and Surf-Tracker's `blobs.js`. Install-time
+dependency-free (`@netlify/blobs` via the same dynamic `import()` as the
+distributed limiter) and no-op on failure (a null store reads as a miss).
+- `openStore(name, opts?)` (async) → a Blobs store, or `null` when Blobs isn't
+  available. Passes explicit credentials when both a site ID and token resolve
+  (`opts.siteID`/`opts.token` override `BLOBS_SITE_ID`/`NETLIFY_SITE_ID`/`SITE_ID`
+  and `BLOBS_TOKEN`/`NETLIFY_API_TOKEN`/`NETLIFY_AUTH_TOKEN`); apps that bake in
+  a default site ID pass it as `opts.siteID`. `opts.consistency` (default `strong`).
+- `getTTLCached(store, key, { ttlMs?, now? })` / `setTTLCached(store, key, data,
+  { now? })` — read/write a `{ at }`-stamped entry; reads past `ttlMs` (or a
+  null store / malformed entry / read failure) resolve to `null`, writes are
+  best-effort (`false` on a null store or failed write). Omit `ttlMs` to read
+  without expiry.
+- `blobKey(...parts)` → stable `|`-joined key (nullish parts blank).
+
 **Handler** — `createHandler({ name, rateLimit, distributed, handle, onError })`.
 
 ## Test
