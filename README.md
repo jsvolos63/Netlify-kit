@@ -108,6 +108,30 @@ distributed limiter) and no-op on failure (a null store reads as a miss).
 
 **Handler** — `createHandler({ name, rateLimit, distributed, handle, onError })`.
 
+**Anthropic (Claude) client** — hardened Messages-API call machinery,
+consolidated from Surf-Tracker's non-streaming client (`lib/anthropic.js`) and
+market-monitor's streaming client (`utils/anthropic.mjs`). Raw `fetch` with
+`x-api-key` only (deliberately not the SDK — its env-based auth attached a
+conflicting Authorization header inside Netlify Functions and 401'd), one
+transient-error retry (429/529/5xx), host-tagged errors that never leak the
+api key or the raw upstream body, and `.status`/`.retryAfter` tagging.
+- `callAnthropic(opts)` (async) → concatenated text content. Non-streaming;
+  the retry runs inside the caller's `timeoutMs` deadline budget. `opts`:
+  `{ apiKey, model, system, userText | messages, maxTokens, timeoutMs,
+  baseUrl?, thinking?, effort?, fetchImpl? }`.
+- `openAnthropicStream(opts)` (async) → the ok `Response` (readable `.body`
+  SSE). The retry only re-issues the initial POST — never mid-stream. Bound
+  the whole request with `opts.signal` (e.g. `AbortSignal.timeout(...)`).
+- `parseModelJson(text)` — first balanced JSON object out of prose/fences.
+- `toBullets(v, maxChars)` — normalize a model value into capped bullets.
+- `userFacingReason(e, detail)` — honest 429 "busy, wait Ns" message from the
+  tagged `retryAfter`; `detail` otherwise.
+- `normalizeEffort(value, def='low')` — validate an env-configured
+  `output_config.effort` level (`low`…`max`).
+- `ANTHROPIC_VERSION`, `ANTHROPIC_DEFAULT_MODEL` (+ `DEFAULT_MODEL` alias,
+  Surf-Tracker's name) — Opus 4.8; pair with explicit `effort` to stay inside
+  a synchronous function's time budget.
+
 ## Test
 
 ```bash

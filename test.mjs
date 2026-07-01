@@ -47,6 +47,15 @@ import {
   blobKey,
   getTTLCached,
   setTTLCached,
+  ANTHROPIC_VERSION,
+  ANTHROPIC_DEFAULT_MODEL,
+  DEFAULT_MODEL,
+  normalizeEffort,
+  callAnthropic,
+  openAnthropicStream,
+  parseModelJson,
+  toBullets,
+  userFacingReason,
 } from './index.js';
 
 // ───────────────────────── shared fakes ─────────────────────────
@@ -404,4 +413,232 @@ test('openStore: returns null when @netlify/blobs is unavailable (install-time d
   // The kit doesn't depend on @netlify/blobs, so the dynamic import fails here
   // and openStore degrades to null rather than throwing.
   assert.equal(await openStore('any-store'), null);
+});
+
+// ───────────────────────── Anthropic (Claude) client ─────────────────────────
+
+// A minimal Response-shaped fake. `headers.get` is case-insensitive like the
+// real Headers; `json`/`text`/`body` cover both entry points.
+function fakeAnthropicResponse({ ok = true, status = 200, headers = {}, jsonBody, textBody = '', withBody = false } = {}) {
+  const lower = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), String(v)]));
+  return {
+    ok,
+    status,
+    headers: { get: (name) => (name.toLowerCase() in lower ? lower[name.toLowerCase()] : null) },
+    json: async () => jsonBody,
+    text: async () => textBody,
+    body: withBody ? {} : null,
+  };
+}
+
+const textContent = (...texts) => ({
+  content: texts.map((t) => ({ type: 'text', text: t })),
+});
+
+test('model constants: Opus 4.8 default, DEFAULT_MODEL alias, version header', () => {
+  assert.equal(ANTHROPIC_DEFAULT_MODEL, 'claude-opus-4-8');
+  assert.equal(DEFAULT_MODEL, ANTHROPIC_DEFAULT_MODEL);
+  assert.equal(ANTHROPIC_VERSION, '2023-06-01');
+});
+
+test('normalizeEffort: accepts the five levels, trims/lowers, falls back', () => {
+  for (const lvl of ['low', 'medium', 'high', 'xhigh', 'max']) {
+    assert.equal(normalizeEffort(lvl), lvl);
+  }
+  assert.equal(normalizeEffort(' HIGH '), 'high');
+  assert.equal(normalizeEffort('turbo'), 'low'); // default def
+  assert.equal(normalizeEffort(undefined, 'medium'), 'medium');
+  assert.equal(normalizeEffort('', 'high'), 'high');
+});
+
+test('callAnthropic: concatenates text blocks; sends headers, payload, effort, thinking', async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, init });
+    return fakeAnthropicResponse({ jsonBody: textContent('Hello, ', 'world') });
+  };
+  const out = await callAnthropic({
+    apiKey: 'sk-test',
+    model: 'claude-opus-4-8',
+    system: 'be brief',
+    userText: 'hi',
+    maxTokens: 100,
+    timeoutMs: 2000,
+    thinking: { type: 'adaptive' },
+    effort: 'low',
+    fetchImpl,
+  });
+  assert.equal(out, 'Hello, world');
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /https:\/\/api\.anthropic\.com\/v1\/messages$/);
+  assert.equal(calls[0].init.headers['x-api-key'], 'sk-test');
+  assert.equal(calls[0].init.headers['anthropic-version'], ANTHROPIC_VERSION);
+  const payload = JSON.parse(calls[0].init.body);
+  assert.deepEqual(payload.messages, [{ role: 'user', content: 'hi' }]);
+  assert.deepEqual(payload.thinking, { type: 'adaptive' });
+  assert.deepEqual(payload.output_config, { effort: 'low' });
+  assert.equal(payload.stream, undefined); // non-streaming entry point
+});
+
+test('callAnthropic: a full messages array takes precedence over userText', async () => {
+  let payload;
+  const fetchImpl = async (url, init) => {
+    payload = JSON.parse(init.body);
+    return fakeAnthropicResponse({ jsonBody: textContent('ok') });
+  };
+  const messages = [
+    { role: 'user', content: 'q1' },
+    { role: 'assistant', content: 'a1' },
+    { role: 'user', content: 'q2' },
+  ];
+  await callAnthropic({ apiKey: 'k', model: 'm', userText: 'ignored', messages, maxTokens: 10, timeoutMs: 2000, fetchImpl });
+  assert.deepEqual(payload.messages, messages);
+});
+
+test('callAnthropic: retries once on 429 and tags status + retryAfter on final failure', async () => {
+  // 429 twice → both attempts consumed → throws with tagged status/retryAfter.
+  let attempts = 0;
+  const fetchImpl = async () => {
+    attempts += 1;
+    return fakeAnthropicResponse({ ok: false, status: 429, headers: { 'retry-after': '7' }, textBody: '{"error":"rate"}' });
+  };
+  await assert.rejects(
+    callAnthropic({ apiKey: 'k', model: 'm', userText: 'x', maxTokens: 10, timeoutMs: 10_000, fetchImpl }),
+    (e) => e.status === 429 && e.retryAfter === 7 && /HTTP 429/.test(e.message),
+  );
+  assert.equal(attempts, 2);
+});
+
+test('callAnthropic: 429 then success → returns the retried result', async () => {
+  let attempts = 0;
+  const fetchImpl = async () => {
+    attempts += 1;
+    if (attempts === 1) return fakeAnthropicResponse({ ok: false, status: 529, textBody: 'overloaded' });
+    return fakeAnthropicResponse({ jsonBody: textContent('recovered') });
+  };
+  const out = await callAnthropic({ apiKey: 'k', model: 'm', userText: 'x', maxTokens: 10, timeoutMs: 10_000, fetchImpl });
+  assert.equal(out, 'recovered');
+  assert.equal(attempts, 2);
+});
+
+test('callAnthropic: non-retryable 400 fails after a single attempt', async () => {
+  let attempts = 0;
+  const fetchImpl = async () => {
+    attempts += 1;
+    return fakeAnthropicResponse({ ok: false, status: 400, textBody: 'bad request' });
+  };
+  await assert.rejects(
+    callAnthropic({ apiKey: 'k', model: 'm', userText: 'x', maxTokens: 10, timeoutMs: 10_000, fetchImpl }),
+    (e) => e.status === 400,
+  );
+  assert.equal(attempts, 1);
+});
+
+test('callAnthropic: connect failure reports the host and does not leak the key', async () => {
+  const fetchImpl = async () => {
+    const err = new TypeError('fetch failed');
+    err.cause = { code: 'ENOTFOUND' };
+    throw err;
+  };
+  await assert.rejects(
+    callAnthropic({ apiKey: 'sk-secret', model: 'm', userText: 'x', maxTokens: 10, timeoutMs: 500, fetchImpl }),
+    (e) => /api\.anthropic\.com/.test(e.message) && /ENOTFOUND/.test(e.message) && !e.message.includes('sk-secret'),
+  );
+});
+
+test('callAnthropic: upstream error message is capped and never carries the key', async () => {
+  const fetchImpl = async () =>
+    fakeAnthropicResponse({ ok: false, status: 500, textBody: 'x'.repeat(1000) });
+  await assert.rejects(
+    callAnthropic({ apiKey: 'sk-secret', model: 'm', userText: 'x', maxTokens: 10, timeoutMs: 1400, fetchImpl }),
+    (e) => e.message.length < 300 && !e.message.includes('sk-secret'),
+  );
+});
+
+test('callAnthropic: baseUrl override is used and surfaced in errors', async () => {
+  const fetchImpl = async (url) => {
+    assert.match(url, /^https:\/\/proxy\.example\.com\/v1\/messages$/);
+    return fakeAnthropicResponse({ ok: false, status: 503, textBody: 'down' });
+  };
+  await assert.rejects(
+    callAnthropic({ apiKey: 'k', model: 'm', userText: 'x', maxTokens: 10, timeoutMs: 1400, baseUrl: 'https://proxy.example.com/', fetchImpl }),
+    (e) => /proxy\.example\.com HTTP 503/.test(e.message),
+  );
+});
+
+test('openAnthropicStream: returns the ok Response with a readable body; stream:true in payload', async () => {
+  let payload;
+  const fetchImpl = async (url, init) => {
+    payload = JSON.parse(init.body);
+    return fakeAnthropicResponse({ withBody: true });
+  };
+  const res = await openAnthropicStream({
+    apiKey: 'k', model: 'claude-sonnet-4-6', system: 's',
+    messages: [{ role: 'user', content: 'x' }], maxTokens: 50, fetchImpl,
+  });
+  assert.ok(res.ok && res.body);
+  assert.equal(payload.stream, true);
+});
+
+test('openAnthropicStream: retries once on transient 5xx, then succeeds', async () => {
+  let attempts = 0;
+  const fetchImpl = async () => {
+    attempts += 1;
+    if (attempts === 1) return fakeAnthropicResponse({ ok: false, status: 503, textBody: 'down' });
+    return fakeAnthropicResponse({ withBody: true });
+  };
+  const res = await openAnthropicStream({ apiKey: 'k', model: 'm', messages: [], maxTokens: 10, fetchImpl });
+  assert.ok(res.ok);
+  assert.equal(attempts, 2);
+});
+
+test('openAnthropicStream: an abort is terminal — no retry', async () => {
+  let attempts = 0;
+  const fetchImpl = async () => {
+    attempts += 1;
+    const err = new Error('This operation was aborted');
+    err.name = 'AbortError';
+    throw err;
+  };
+  await assert.rejects(
+    openAnthropicStream({ apiKey: 'k', model: 'm', messages: [], maxTokens: 10, fetchImpl }),
+    /AbortError/,
+  );
+  assert.equal(attempts, 1);
+});
+
+test('openAnthropicStream: tags status + retryAfter for the caller', async () => {
+  const fetchImpl = async () =>
+    fakeAnthropicResponse({ ok: false, status: 429, headers: { 'Retry-After': '30' }, textBody: 'rate' });
+  await assert.rejects(
+    openAnthropicStream({ apiKey: 'k', model: 'm', messages: [], maxTokens: 10, fetchImpl }),
+    (e) => e.status === 429 && e.retryAfter === 30,
+  );
+});
+
+test('parseModelJson: plain JSON, prose/fence-wrapped JSON, junk throws', () => {
+  assert.deepEqual(parseModelJson('{"a":1}'), { a: 1 });
+  assert.deepEqual(parseModelJson('Sure! Here it is:\n```json\n{"a":[1,2]}\n```\nHope that helps.'), { a: [1, 2] });
+  assert.deepEqual(parseModelJson('  {"nested":{"b":true}} '), { nested: { b: true } });
+  assert.throws(() => parseModelJson('no json here'), /parseable JSON/);
+  assert.throws(() => parseModelJson(''), /parseable JSON/);
+});
+
+test('toBullets: arrays, delimited blobs, glyph stripping, caps, junk', () => {
+  assert.deepEqual(toBullets(['- one', '• two', '3. three'], 100), ['one', 'two', 'three']);
+  assert.deepEqual(toBullets('- a\n- b\n\n- c', 100), ['a', 'b', 'c']);
+  assert.deepEqual(toBullets('x'.repeat(50), 10), ['x'.repeat(10)]);
+  assert.deepEqual(toBullets(null, 100), []);
+  assert.deepEqual(toBullets(42, 100), []);
+  assert.deepEqual(toBullets(['', '  ', '- real'], 100), ['real']);
+});
+
+test('userFacingReason: honest 429 message, fallback detail otherwise', () => {
+  const rate = Object.assign(new Error('x'), { status: 429, retryAfter: 12 });
+  assert.match(userFacingReason(rate, 'detail'), /about 12s/);
+  const rateNoWindow = Object.assign(new Error('x'), { status: 429 });
+  assert.match(userFacingReason(rateNoWindow, 'detail'), /a minute/);
+  const other = Object.assign(new Error('x'), { status: 500 });
+  assert.equal(userFacingReason(other, 'fallback text'), 'fallback text');
+  assert.equal(userFacingReason(null, 'fallback text'), 'fallback text');
 });

@@ -737,3 +737,260 @@ export function createHandler(options) {
     }
   };
 }
+
+/* ═══════════════════════ Anthropic (Claude) client ═══════════════════════
+ *
+ * Hardened Messages-API call machinery, consolidated from the two hand-synced
+ * copies in the family: Surf-Tracker's non-streaming client
+ * (netlify/functions/lib/anthropic.js — summarize.js / summary-chat.js) and
+ * market-monitor's streaming client (netlify/functions/utils/anthropic.mjs —
+ * analyze.mjs / analysis-core.mjs). Both call sites keep their exact semantics;
+ * only the import path changes.
+ *
+ * Shared hardening, both entry points:
+ *   - one transient-error retry (429 / 529 / 5xx) before giving up,
+ *   - host-tagged error messages that never leak the api key or the raw
+ *     upstream body into a response (a 429 body carries the org id),
+ *   - `.status` and `.retryAfter` tagged on the thrown error so callers can
+ *     surface an honest "busy, try again in Ns" (see userFacingReason).
+ *
+ * Auth: x-api-key only, via raw fetch — deliberately NOT the Anthropic SDK.
+ * The SDK's env-based auth resolution attached a conflicting Authorization
+ * header inside Netlify Functions and 401'd; the raw x-api-key call
+ * authenticates cleanly, and it keeps this kit dependency-free.
+ */
+
+export const ANTHROPIC_VERSION = '2023-06-01';
+
+/** Default to Opus 4.8 — the most capable model — for the highest-quality
+ *  output. Opus is slower and pricier than the small models, so callers pair
+ *  it with an explicit `effort` (typically "low") to bound thinking/token
+ *  spend under a synchronous Netlify function's ~26s budget. Override
+ *  per-endpoint via an env var at the call site. */
+export const ANTHROPIC_DEFAULT_MODEL = 'claude-opus-4-8';
+// Name used by the existing Surf-Tracker call sites, kept as an alias.
+export const DEFAULT_MODEL = ANTHROPIC_DEFAULT_MODEL;
+
+const ANTHROPIC_BASE_URL = 'https://api.anthropic.com';
+
+/** Effort levels accepted by output_config.effort ("max" is Opus-tier only).
+ *  Validates an env-configured effort before sending it. */
+const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+export function normalizeEffort(value, def = 'low') {
+  const v = String(value == null ? '' : value).trim().toLowerCase();
+  return EFFORT_LEVELS.has(v) ? v : def;
+}
+
+const anthropicSleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
+
+function anthropicBase(opts) {
+  const base = (opts.baseUrl || process.env.ANTHROPIC_BASE_URL || ANTHROPIC_BASE_URL).replace(/\/+$/, '');
+  // Host we're actually calling — surfaced in errors so a hung request makes
+  // it obvious whether we're hitting api.anthropic.com or a stray override.
+  let host;
+  try { host = new URL(base).host; } catch { host = base; }
+  return { base, host };
+}
+
+function anthropicHeaders(apiKey) {
+  return {
+    'content-type': 'application/json',
+    'x-api-key': apiKey,
+    'anthropic-version': ANTHROPIC_VERSION,
+  };
+}
+
+// Tag the status (and Retry-After, if any) on the error so callers can render
+// a clean, actionable message — and NOT leak the raw upstream body.
+function tagUpstreamError(host, res, body) {
+  const err = new Error(`${host} HTTP ${res.status}: ${String(body || '').slice(0, 200)}`);
+  err.status = res.status;
+  const retryAfter = res.headers && typeof res.headers.get === 'function'
+    ? Number(res.headers.get('retry-after'))
+    : NaN;
+  if (Number.isFinite(retryAfter) && retryAfter > 0) err.retryAfter = retryAfter;
+  return err;
+}
+
+const isRetryableAnthropicStatus = (status) =>
+  status === 429 || status === 529 || (status >= 500 && status < 600);
+
+/**
+ * Call the Messages API (non-streaming) and return the concatenated text
+ * content. Throws on a non-2xx (after one transient retry while time remains
+ * in `timeoutMs`) or a network/timeout failure, with a host-tagged message the
+ * caller can surface in a degraded response.
+ *
+ * opts: { apiKey, model, system, userText, messages, maxTokens, timeoutMs,
+ *         baseUrl, thinking, effort, fetchImpl }
+ *   userText — convenience for a single-turn call (wrapped as one user message)
+ *   messages — full Anthropic messages array for a multi-turn call; takes
+ *              precedence over userText when present and non-empty
+ *   system   — string or the array-with-cache_control form; passed through
+ *   thinking — e.g. { type: "adaptive" }; omitted → model default
+ *   effort   — "low".."max"; sent as output_config.effort to bound token spend
+ *   fetchImpl — injectable for tests (default globalThis.fetch)
+ */
+export async function callAnthropic(opts) {
+  const { apiKey, model, system, userText, messages, maxTokens, timeoutMs, thinking, effort } = opts;
+  const fetchImpl = opts.fetchImpl || globalThis.fetch;
+  const { base, host } = anthropicBase(opts);
+  const payload = {
+    model,
+    max_tokens: maxTokens,
+    system,
+    messages: Array.isArray(messages) && messages.length
+      ? messages
+      : [{ role: 'user', content: userText }],
+  };
+  // Adaptive thinking keeps Opus's reasoning in (omitted) thinking blocks
+  // rather than leaking into the visible output; effort caps how much of it
+  // (and the overall token spend) happens, which is what keeps Opus inside a
+  // synchronous function's time budget. Both are GA on the raw endpoint.
+  if (thinking) payload.thinking = thinking;
+  if (effort) payload.output_config = { effort };
+  const reqBody = JSON.stringify(payload);
+  const deadline = Date.now() + timeoutMs;
+
+  // Up to two attempts: a transient 429/529/5xx (rate limit / overloaded) gets
+  // one short retry while time remains, before we give up and let the caller
+  // degrade.
+  let res, lastErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const budget = deadline - Date.now();
+    if (budget <= 0) break;
+    const started = Date.now();
+    const ctl = new AbortController();
+    const timer = setTimeout(() => { try { ctl.abort(); } catch { /* already settled */ } }, budget);
+    try {
+      res = await fetchImpl(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: anthropicHeaders(apiKey),
+        body: reqBody,
+        signal: ctl.signal,
+      });
+    } catch (e) {
+      // Connect/TLS/abort failures. Report the host, how long it hung, and the
+      // underlying cause so "aborted after ~timeout" (network/host unreachable)
+      // is distinguishable from a fast failure (e.g. ENOTFOUND → wrong URL).
+      const cause = e && e.cause && (e.cause.code || e.cause.message);
+      lastErr = new Error(
+        `request to ${host} did not complete after ${Date.now() - started}ms ` +
+        `(${(e && e.name) || 'Error'}${cause ? ': ' + cause : ''})`,
+      );
+      break; // a timeout/abort won't succeed on retry within the same budget
+    } finally {
+      clearTimeout(timer);
+    }
+    if (res.ok) break;
+    const body = await res.text().catch(() => '');
+    lastErr = tagUpstreamError(host, res, body);
+    const retryable = isRetryableAnthropicStatus(res.status);
+    res = null;
+    if (!retryable || attempt === 1 || deadline - Date.now() < 1500) break;
+    await anthropicSleep(Math.min(1000, Math.max(0, deadline - Date.now() - 1000)));
+  }
+  if (!res) throw lastErr || new Error('model call failed');
+
+  const data = await res.json();
+  return Array.isArray(data.content)
+    ? data.content.filter((p) => p && p.type === 'text').map((p) => p.text).join('')
+    : '';
+}
+
+/**
+ * Issue a streaming Messages request, retrying once on a transient upstream
+ * failure before any bytes are consumed. Resolves to the ok Response (with a
+ * readable `.body`); throws a tagged Error otherwise.
+ *
+ * The retry only ever re-issues the initial POST. Once the upstream returns
+ * 2xx with a readable body we hand that Response back and the caller consumes
+ * the SSE — we never retry mid-stream. Bound the whole request (headers +
+ * stream) by passing an AbortSignal (e.g. AbortSignal.timeout(...)).
+ *
+ * opts: { apiKey, model, system, messages, maxTokens, effort, thinking,
+ *         signal, baseUrl, fetchImpl }
+ */
+export async function openAnthropicStream(opts) {
+  const { apiKey, model, system, messages, maxTokens, effort, thinking, signal } = opts;
+  const fetchImpl = opts.fetchImpl || globalThis.fetch;
+  const { base, host } = anthropicBase(opts);
+
+  const payload = { model, max_tokens: maxTokens, stream: true, system, messages };
+  if (thinking) payload.thinking = thinking;
+  if (effort) payload.output_config = { effort };
+  const body = JSON.stringify(payload);
+
+  let lastErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let res;
+    try {
+      res = await fetchImpl(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: anthropicHeaders(apiKey),
+        body,
+        signal,
+      });
+    } catch (e) {
+      // Connect / TLS / abort. An abort won't recover on retry.
+      const cause = e && e.cause && (e.cause.code || e.cause.message);
+      lastErr = new Error(`request to ${host} failed (${(e && e.name) || 'Error'}${cause ? ': ' + cause : ''})`);
+      if (e && e.name === 'AbortError') break;
+      if (attempt === 0) { await anthropicSleep(500); continue; }
+      break;
+    }
+
+    if (res.ok && res.body) return res;
+
+    const detail = await res.text().catch(() => '');
+    lastErr = tagUpstreamError(host, res, detail);
+    if (!isRetryableAnthropicStatus(res.status) || attempt === 1) break;
+    await anthropicSleep(600);
+  }
+  throw lastErr || new Error('model call failed');
+}
+
+/** Models occasionally wrap JSON in prose or fences despite instructions; pull
+ *  out the first balanced JSON object and parse that. */
+export function parseModelJson(text) {
+  const trimmed = String(text || '').trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    /* fall through to brace extraction */
+  }
+  const start = trimmed.indexOf('{');
+  const end = trimmed.lastIndexOf('}');
+  if (start !== -1 && end > start) {
+    return JSON.parse(trimmed.slice(start, end + 1));
+  }
+  throw new Error('model did not return parseable JSON');
+}
+
+/** Normalize a model value into a clean array of bullet strings. Tolerates an
+ *  array (the schema), a single string, or a newline/▪-delimited blob. Strips
+ *  leading bullet glyphs and length-caps each (maxChars) so a runaway response
+ *  can't bloat a cached blob or the UI. */
+export function toBullets(v, maxChars) {
+  let arr;
+  if (Array.isArray(v)) arr = v;
+  else if (typeof v === 'string') arr = v.split(/\r?\n+/);
+  else return [];
+  return arr
+    .map((x) => String(x == null ? '' : x).replace(/^\s*[-•*\d.]+\s*/, '').trim().slice(0, maxChars))
+    .filter(Boolean);
+}
+
+/** A clean, user-facing reason for a failed callAnthropic/openAnthropicStream,
+ *  derived from the error's tagged status. A 429 (the org's tokens-per-minute
+ *  cap, common on lower API tiers) gets a short "try again" message with the
+ *  real Retry-After window when the upstream provided one — instead of the raw
+ *  429 JSON, which carries the org id and is meaningless to the user.
+ *  Everything else falls back to the bounded detail string the caller passes. */
+export function userFacingReason(e, detail) {
+  if (e && e.status === 429) {
+    const wait = e.retryAfter ? `about ${e.retryAfter}s` : 'a minute';
+    return `The AI service is busy right now (rate limit reached). Wait ${wait} and try again.`;
+  }
+  return detail;
+}
