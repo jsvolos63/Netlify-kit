@@ -43,6 +43,10 @@ import {
   _resetRateLimit,
   MAX_QUERY_LENGTH,
   createHandler,
+  openStore,
+  blobKey,
+  getTTLCached,
+  setTTLCached,
 } from './index.js';
 
 // ───────────────────────── shared fakes ─────────────────────────
@@ -324,4 +328,80 @@ test('createHandler: preflight, happy path, rate limit, error → 500, onError',
   assert.equal((await custom(eventWith({}))).statusCode, 503);
 
   assert.throws(() => createHandler({}), /handle option is required/);
+});
+
+// ─────────────── Netlify Blobs: store opener + short-TTL cache ───────────────
+
+// In-memory fake matching the { get(key,{type:'json'}), setJSON(key,val) } shape.
+function fakeStore() {
+  const m = new Map();
+  return {
+    get: async (k) => (m.has(k) ? m.get(k) : null),
+    // Round-trip through JSON like the real Blobs store does, so undefined
+    // values are dropped exactly as they would be in production.
+    setJSON: async (k, v) => { m.set(k, JSON.parse(JSON.stringify(v))); },
+    _map: m,
+  };
+}
+
+test('blobKey: joins parts with | and blanks nullish', () => {
+  assert.equal(blobKey('UA123', '2026-07-01'), 'UA123|2026-07-01');
+  assert.equal(blobKey('UA123', null, undefined, 'x'), 'UA123|||x');
+  assert.equal(blobKey(), '');
+});
+
+test('setTTLCached / getTTLCached: round-trip, TTL expiry, and null-store no-op', async () => {
+  const store = fakeStore();
+
+  // Write stamps { at, data }; read returns data within the TTL.
+  assert.equal(await setTTLCached(store, 'k', { v: 1 }, { now: 1000 }), true);
+  assert.deepEqual(store._map.get('k'), { at: 1000, data: { v: 1 } });
+  assert.deepEqual(await getTTLCached(store, 'k', { ttlMs: 45_000, now: 1000 }), { v: 1 });
+
+  // Fresh enough vs. stale past the TTL.
+  assert.deepEqual(await getTTLCached(store, 'k', { ttlMs: 45_000, now: 45_000 }), { v: 1 });
+  assert.equal(await getTTLCached(store, 'k', { ttlMs: 45_000, now: 46_001 }), null);
+
+  // No ttlMs → no expiry.
+  assert.deepEqual(await getTTLCached(store, 'k', { now: 10_000_000 }), { v: 1 });
+
+  // Missing key → null.
+  assert.equal(await getTTLCached(store, 'absent', { ttlMs: 1000 }), null);
+
+  // A null store (Blobs unavailable) is a graceful no-op, never a throw.
+  assert.equal(await getTTLCached(null, 'k', { ttlMs: 1000 }), null);
+  assert.equal(await setTTLCached(null, 'k', { v: 2 }), false);
+});
+
+test('getTTLCached: undefined data reads back as null; falsy-but-real values round-trip', async () => {
+  const store = fakeStore();
+
+  // undefined data → JSON drops it → the entry is content-less. It must read as
+  // null (a miss), never undefined, so a `=== null` check can't mistake it.
+  await setTTLCached(store, 'u', undefined, { now: 1000 });
+  assert.deepEqual(store._map.get('u'), { at: 1000 }); // data key dropped by JSON
+  assert.equal(await getTTLCached(store, 'u', { ttlMs: 45_000, now: 1000 }), null);
+
+  // Genuine falsy values are real hits and must survive intact.
+  for (const [key, val] of [['n', null], ['f', false], ['z', 0], ['e', '']]) {
+    await setTTLCached(store, key, val, { now: 1000 });
+    assert.strictEqual(await getTTLCached(store, key, { ttlMs: 45_000, now: 1000 }), val);
+  }
+});
+
+test('getTTLCached: malformed entry and read failure resolve to null', async () => {
+  const noStamp = { get: async () => ({ data: { v: 1 } }), setJSON: async () => {} }; // missing .at
+  assert.equal(await getTTLCached(noStamp, 'k', { ttlMs: 1000 }), null);
+
+  const boom = { get: async () => { throw new Error('blobs down'); }, setJSON: async () => {} };
+  assert.equal(await getTTLCached(boom, 'k', { ttlMs: 1000 }), null);
+
+  const failWrite = { setJSON: async () => { throw new Error('blobs down'); } };
+  assert.equal(await setTTLCached(failWrite, 'k', { v: 1 }), false);
+});
+
+test('openStore: returns null when @netlify/blobs is unavailable (install-time dependency-free)', async () => {
+  // The kit doesn't depend on @netlify/blobs, so the dynamic import fails here
+  // and openStore degrades to null rather than throwing.
+  assert.equal(await openStore('any-store'), null);
 });

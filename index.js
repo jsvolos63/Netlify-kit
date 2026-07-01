@@ -603,6 +603,84 @@ export function rateLimit(event, { name, windowMs, max }, now = Date.now()) {
 /** Test-only reset of the per-name bucket state. */
 export function _resetRateLimit() { buckets.clear(); }
 
+// ─────────────── Netlify Blobs: store opener + short-TTL cache ───────────────
+//
+// Generalized from FlightCheck's flightCache.js (short-TTL get/set with graceful
+// degradation) and Surf-Tracker's blobs.js (explicit-credential store opener).
+// Install-time dependency-free: @netlify/blobs is reached through the same
+// dynamic import() as the distributed limiter, and every op degrades to a no-op
+// (a null store reads as a miss) so a storage hiccup can never break a request.
+
+/** Open a Blobs store, or null when Blobs isn't available (local dev, unit
+ *  tests, or a deploy where the runtime context isn't discoverable — a known
+ *  esbuild/@netlify/blobs interaction). Passes explicit credentials when BOTH a
+ *  site ID and token resolve, which is what makes storage work on sites where
+ *  the runtime auto-config isn't found; otherwise falls back to the plain
+ *  runtime-configured getStore. Resolution (override per-call via opts):
+ *    consistency — opts.consistency (default 'strong')
+ *    siteID      — opts.siteID || BLOBS_SITE_ID / NETLIFY_SITE_ID / SITE_ID
+ *    token       — opts.token  || BLOBS_TOKEN / NETLIFY_API_TOKEN / NETLIFY_AUTH_TOKEN
+ *  Apps that bake in their own default site ID pass it as opts.siteID. */
+export async function openStore(name, opts = {}) {
+  let getStore;
+  try {
+    ({ getStore } = await import('@netlify/blobs'));
+  } catch {
+    return null;
+  }
+  const consistency = opts.consistency || 'strong';
+  const siteID = opts.siteID || process.env.BLOBS_SITE_ID || process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
+  const token = opts.token || process.env.BLOBS_TOKEN || process.env.NETLIFY_API_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
+  const cfg = { name, consistency };
+  if (siteID && token) { cfg.siteID = siteID; cfg.token = token; }
+  try {
+    return getStore(cfg);
+  } catch {
+    return null;
+  }
+}
+
+/** Build a stable cache key by joining the distinguishing parts with '|'
+ *  (nullish parts become ''). e.g. blobKey(flight, date) → "UA123|2026-07-01". */
+export function blobKey(...parts) {
+  return parts.map((p) => (p == null ? '' : String(p))).join('|');
+}
+
+/** Read a TTL-stamped entry written by setTTLCached. Returns the stored `data`
+ *  when present and — if `ttlMs` is given — fresher than it; otherwise null. A
+ *  null store, malformed entry, or transient read failure all resolve to null
+ *  so the caller fetches live. Omit `ttlMs` to read without expiry.
+ *
+ *  Note: an entry cached with `data: undefined` serializes to `{ at }` (JSON
+ *  drops undefined), so its data reads back as `undefined` — normalized to null
+ *  here so a `=== null` miss check can't mistake it for a real hit. Falsy-but-
+ *  real values (null, false, 0, '') round-trip intact. */
+export async function getTTLCached(store, key, { ttlMs, now = Date.now() } = {}) {
+  if (!store) return null;
+  try {
+    const entry = await store.get(key, { type: 'json' });
+    if (!entry || typeof entry.at !== 'number') return null;
+    if (ttlMs != null && now - entry.at > ttlMs) return null;
+    return entry.data === undefined ? null : entry.data;
+  } catch {
+    return null;
+  }
+}
+
+/** Write `data` under `key` with a `{ at }` write timestamp for getTTLCached.
+ *  Best-effort: a null store or a failed write is swallowed and returns false —
+ *  caching is an optimization, never a correctness requirement. Returns true on
+ *  a successful write. */
+export async function setTTLCached(store, key, data, { now = Date.now() } = {}) {
+  if (!store) return false;
+  try {
+    await store.setJSON(key, { at: now, data });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ─────────────────────── handler factory ────────────────────────
 //
 // Wraps the cross-cutting concerns every function needs — CORS preflight,
