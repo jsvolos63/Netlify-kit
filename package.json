@@ -1,6 +1,6 @@
 {
   "name": "@jfs/netlify-kit",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Shared, dependency-free Netlify Functions primitives (CORS + preflight, JSON/text/error responses, capped body reads, input validation, SSRF guards, retry-with-backoff fetch, per-IP rate limiting, a Blobs store opener + short-TTL cache, a createHandler boundary, and a hardened Anthropic (Claude) Messages-API client) extracted from the JFS family of buildless static sites.",
   "type": "module",
   "license": "MIT",
@@ -38,6 +38,6 @@
     "bin"
   ],
   "scripts": {
-    "test": "node test.mjs && node --test test-vendor.mjs"
+    "test": "node --test test.mjs test-vendor.mjs"
   }
 }
