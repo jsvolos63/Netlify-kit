@@ -132,6 +132,22 @@ api key or the raw upstream body, and `.status`/`.retryAfter` tagging.
   Surf-Tracker's name) — Opus 4.8; pair with explicit `effort` to stay inside
   a synchronous function's time budget.
 
+## Vendoring into a consumer
+
+Consumer repos don't deploy `node_modules`; they pin this package by full
+commit SHA and commit a generated copy under `netlify/functions/`, gated by a
+CI drift check. The kit ships its own vendoring CLI (`jfs-netlify-kit-vendor`):
+
+```json
+"vendor:sync":  "jfs-netlify-kit-vendor --format esm --out netlify/functions/lib/netlify-kit.js",
+"vendor:check": "jfs-netlify-kit-vendor --format esm --out netlify/functions/lib/netlify-kit.js --check"
+```
+
+Use `--format cjs` instead when the consumer's functions are CommonJS (it
+emits a `module.exports` transform, e.g. market-monitor's
+`netlify/functions/utils/netlify-kit.js`). The exported surface is derived
+from `index.js`'s own `export` declarations — never a hand-maintained list.
+
 ## Test
 
 ```bash
