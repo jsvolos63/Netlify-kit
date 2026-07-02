@@ -1,4 +1,4 @@
-// @jfs/netlify-kit v0.2.0 — shared serverless-function primitives for the JFS
+// @jfs/netlify-kit — shared serverless-function primitives for the JFS
 // family of buildless static sites deployed on Netlify.
 //
 // Every sibling app that ships Netlify Functions (market-monitor, Surf-Tracker,
