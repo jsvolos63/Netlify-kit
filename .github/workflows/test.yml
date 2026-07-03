@@ -1,6 +1,7 @@
-# Runs the kit's node:test suite on every push and PR. The kit and its tests
-# are dependency-free (the Blobs helpers take an injected store), so there is
-# no install step.
+# Runs the kit's node:test suite on every push and PR. index.js itself is
+# dependency-free (the Blobs helpers take an injected store), but the vendor
+# CLI shim (bin/vendor.mjs) imports @jfs/vendor-cli, so an install step is
+# required before the tests.
 name: Test
 
 on:
@@ -24,5 +25,8 @@ jobs:
       - name: Syntax-check the shipped module
         run: node --check index.js
 
+      - name: Install dependencies
+        run: npm install
+
       - name: Run tests
-        run: node test.mjs
+        run: npm test
