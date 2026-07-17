@@ -418,7 +418,10 @@ export async function fetchWithRetry(url, init, opts) {
 
 // ──────────────────────── rate limiting ─────────────────────────
 //
-// Two limiters the family uses, kept as their origin apps shipped them:
+// ONE fixed-window engine (per-name × per-IP buckets), exposed through the two
+// calling conventions the family's apps already ship — the conventions are
+// kept source-compatible, but they now share buckets, IP extraction, pruning,
+// and the test seam instead of being two parallel limiters:
 //   • checkRateLimit / checkRateLimitDistributed — return a ready-to-return
 //     429 / 414 response object (or null). market-monitor's createHandler form.
 //   • rateLimit — a low-level fixed-window check returning { ok, retryAfter },
@@ -429,63 +432,74 @@ export async function fetchWithRetry(url, init, opts) {
 const IP_RE = /^(?:\d{1,3}\.){3}\d{1,3}$|^[0-9a-fA-F:]{2,39}$/;
 export const MAX_QUERY_LENGTH = 2048;
 
-// --- market-monitor: checkRateLimit (single shared Map, keyed by IP) ---
+// --- shared engine: per-`${name}:${ip}` fixed-window buckets ---
 
-const hits = new Map();
-const CLEANUP_INTERVAL = 120_000;
-let lastCleanup = Date.now();
+const buckets = new Map();
+const MAX_KEYS = 5000;
 
-function cleanup(windowMs) {
-  const now = Date.now();
-  if (now - lastCleanup < CLEANUP_INTERVAL) return;
-  lastCleanup = now;
-  for (const [key, entry] of hits) {
-    if (now - entry.windowStart > windowMs * 2) hits.delete(key);
-  }
+/** Validated client IP for bucketing: clientIp() → IP_RE check → 'unknown'.
+ *  Anything unparseable collapses into the shared 'unknown' bucket (fail
+ *  toward throttling rather than toward a bypass). */
+function extractIp(event) {
+  const ip = clientIp(event);
+  return IP_RE.test(ip) ? ip : 'unknown';
 }
 
-function allowRequest(ip, max = 60, windowMs = 60_000) {
-  cleanup(windowMs);
-  const now = Date.now();
-  const key = ip || 'unknown';
-  let entry = hits.get(key);
-  if (!entry || now - entry.windowStart > windowMs) {
-    entry = { count: 1, windowStart: now };
-    hits.set(key, entry);
-    return true;
+function pruneBuckets(now, windowMs) {
+  for (const [k, b] of buckets) {
+    if (now - b.windowStart >= windowMs) buckets.delete(k);
   }
-  entry.count++;
-  return entry.count <= max;
+  if (buckets.size > MAX_KEYS) buckets.clear();
+}
+
+/** Core check. Returns { ok: true } or { ok: false, retryAfter } (seconds,
+ *  time remaining in the caller's current window). */
+function checkWindow(name, ip, max, windowMs, now) {
+  const key = `${name}:${ip}`;
+  let b = buckets.get(key);
+  if (!b || now - b.windowStart >= windowMs) {
+    b = { windowStart: now, count: 0 };
+    buckets.set(key, b);
+  }
+  b.count++;
+  if (buckets.size > MAX_KEYS) pruneBuckets(now, windowMs);
+  if (b.count > max) {
+    return { ok: false, retryAfter: Math.max(1, Math.ceil((b.windowStart + windowMs - now) / 1000)) };
+  }
+  return { ok: true };
+}
+
+function queryTooLongResponse() {
+  return {
+    statusCode: 414,
+    headers: { 'Content-Type': 'application/json', ...corsHeaders },
+    body: JSON.stringify({ error: 'Query string too long' }),
+  };
+}
+
+function tooManyRequestsResponse(retryAfterSeconds) {
+  return {
+    statusCode: 429,
+    headers: {
+      'Content-Type': 'application/json',
+      'Retry-After': String(retryAfterSeconds),
+      ...corsHeaders,
+    },
+    body: JSON.stringify({ error: 'Too many requests' }),
+  };
 }
 
 /** Returns a 429 / 414 response object if rate-limited or the query string is
- *  oversized, or null if allowed. The response already carries CORS headers. */
+ *  oversized, or null if allowed. The response already carries CORS headers.
+ *  Retry-After reflects the actual time left in the window (previously the
+ *  full window length). */
 export function checkRateLimit(event, max = 60, windowMs = 60_000) {
   const qs = event.rawQuery || event.rawQueryString || '';
   if (typeof qs === 'string' && qs.length > MAX_QUERY_LENGTH) {
-    return {
-      statusCode: 414,
-      headers: { 'Content-Type': 'application/json', ...corsHeaders },
-      body: JSON.stringify({ error: 'Query string too long' }),
-    };
+    return queryTooLongResponse();
   }
-  let ip = event.headers?.['x-forwarded-for']?.split(',')[0]?.trim()
-         || event.headers?.['client-ip']
-         || 'unknown';
-  if (!IP_RE.test(ip)) ip = 'unknown';
-
-  if (!allowRequest(ip, max, windowMs)) {
-    return {
-      statusCode: 429,
-      headers: {
-        'Content-Type': 'application/json',
-        'Retry-After': String(Math.ceil(windowMs / 1000)),
-        ...corsHeaders,
-      },
-      body: JSON.stringify({ error: 'Too many requests' }),
-    };
-  }
-  return null;
+  const verdict = checkWindow('ip', extractIp(event), max, windowMs, Date.now());
+  return verdict.ok ? null : tooManyRequestsResponse(verdict.retryAfter);
 }
 
 // --- market-monitor: checkRateLimitDistributed (Netlify Blobs) ---
@@ -504,25 +518,13 @@ function getRateStore() {
   return storePromise;
 }
 
-function extractIp(event) {
-  let ip = event.headers?.['x-forwarded-for']?.split(',')[0]?.trim()
-        || event.headers?.['client-ip']
-        || 'unknown';
-  if (!IP_RE.test(ip)) ip = 'unknown';
-  return ip;
-}
-
 /** Async distributed rate-limit check. Returns a 429 / 414 response object, or
  *  null if allowed. Falls back transparently to `checkRateLimit` when the
  *  Blobs store is unavailable. */
 export async function checkRateLimitDistributed(event, max = 60, windowMs = 60_000) {
   const qs = event.rawQuery || event.rawQueryString || '';
   if (typeof qs === 'string' && qs.length > MAX_QUERY_LENGTH) {
-    return {
-      statusCode: 414,
-      headers: { 'Content-Type': 'application/json', ...corsHeaders },
-      body: JSON.stringify({ error: 'Query string too long' }),
-    };
+    return queryTooLongResponse();
   }
 
   const store = await getRateStore();
@@ -542,15 +544,7 @@ export async function checkRateLimitDistributed(event, max = 60, windowMs = 60_0
 
   const count = (entry?.count || 0) + 1;
   if (count > max) {
-    return {
-      statusCode: 429,
-      headers: {
-        'Content-Type': 'application/json',
-        'Retry-After': String(Math.ceil(windowMs / 1000)),
-        ...corsHeaders,
-      },
-      body: JSON.stringify({ error: 'Too many requests' }),
-    };
+    return tooManyRequestsResponse(Math.max(1, Math.ceil((windowStart + windowMs - now) / 1000)));
   }
   try {
     await store.setJSON(key, { count, expiresAt: windowStart + windowMs * 2 });
@@ -561,10 +555,7 @@ export async function checkRateLimitDistributed(event, max = 60, windowMs = 60_0
 /** Test seam: reset the cached Blobs store promise so tests can stub it. */
 export function _resetStoreCache() { storePromise = null; }
 
-// --- Surf-Tracker: rateLimit (per-name buckets, returns { ok, retryAfter }) ---
-
-const buckets = new Map();
-const MAX_KEYS = 5000;
+// --- Surf-Tracker form: rateLimit (per-name buckets, returns { ok, retryAfter }) ---
 
 /** Best client IP from a Netlify event: `x-nf-client-connection-ip` (the real
  *  client IP Netlify sets) → first `x-forwarded-for` hop → `client-ip` →
@@ -575,32 +566,17 @@ export function clientIp(event) {
   return h['x-nf-client-connection-ip'] || xff || h['client-ip'] || 'unknown';
 }
 
-function pruneBuckets(now, windowMs) {
-  for (const [k, b] of buckets) {
-    if (now - b.windowStart >= windowMs) buckets.delete(k);
-  }
-  if (buckets.size > MAX_KEYS) buckets.clear();
-}
-
 /** Fixed-window check. Returns `{ ok: true }` under the limit, or
  *  `{ ok: false, retryAfter }` (seconds) once `max` is exceeded within
- *  `windowMs`. Fails open by construction. */
+ *  `windowMs`. Fails open by construction. Shares the bucket store with
+ *  checkRateLimit (namespaced by `name`, so counts never collide). */
 export function rateLimit(event, { name, windowMs, max }, now = Date.now()) {
-  const key = `${name}:${clientIp(event)}`;
-  let b = buckets.get(key);
-  if (!b || now - b.windowStart >= windowMs) {
-    b = { windowStart: now, count: 0 };
-    buckets.set(key, b);
-  }
-  b.count++;
-  if (buckets.size > MAX_KEYS) pruneBuckets(now, windowMs);
-  if (b.count > max) {
-    return { ok: false, retryAfter: Math.max(1, Math.ceil((b.windowStart + windowMs - now) / 1000)) };
-  }
-  return { ok: true };
+  return checkWindow(name, clientIp(event), max, windowMs, now);
 }
 
-/** Test-only reset of the per-name bucket state. */
+/** Test-only reset of ALL in-memory limiter state (both calling forms —
+ *  previously this cleared only the rateLimit buckets, leaving tests no way
+ *  to reset checkRateLimit's counters). */
 export function _resetRateLimit() { buckets.clear(); }
 
 // ─────────────── Netlify Blobs: store opener + short-TTL cache ───────────────
