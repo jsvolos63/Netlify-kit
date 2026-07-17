@@ -314,6 +314,36 @@ test('rateLimit (Surf form): { ok, retryAfter } with injected clock', () => {
   assert.equal(rateLimit(ev, { name: 'list', windowMs: 1000, max: 1 }, 200).ok, true);
 });
 
+test('unified engine: _resetRateLimit clears BOTH calling forms', () => {
+  _resetRateLimit();
+  const ev = eventWith({ headers: { 'x-forwarded-for': '2.2.2.2' } });
+  assert.equal(checkRateLimit(ev, 1, 60_000), null);
+  assert.equal(checkRateLimit(ev, 1, 60_000).statusCode, 429);
+  _resetRateLimit(); // previously only reset the Surf-form buckets
+  assert.equal(checkRateLimit(ev, 1, 60_000), null);
+});
+
+test('unified engine: the two forms share IP extraction but not buckets', () => {
+  _resetRateLimit();
+  // checkRateLimit now sees x-nf-client-connection-ip (the real client IP
+  // Netlify sets), like clientIp always did.
+  const ev = eventWith({ headers: { 'x-nf-client-connection-ip': '3.3.3.3' } });
+  assert.equal(checkRateLimit(ev, 1, 60_000), null);
+  assert.equal(checkRateLimit(ev, 1, 60_000).statusCode, 429);
+  // Same IP through the Surf form uses its own named bucket — no collision
+  // with checkRateLimit's 'ip' namespace.
+  assert.equal(rateLimit(ev, { name: 'feed', windowMs: 60_000, max: 1 }, Date.now()).ok, true);
+});
+
+test('checkRateLimit: Retry-After reflects time left in the window', () => {
+  _resetRateLimit();
+  const ev = eventWith({ headers: { 'x-forwarded-for': '6.6.6.6' } });
+  assert.equal(checkRateLimit(ev, 1, 10_000), null);
+  const blocked = checkRateLimit(ev, 1, 10_000);
+  const retryAfter = Number(blocked.headers['Retry-After']);
+  assert.ok(retryAfter >= 1 && retryAfter <= 10, `Retry-After ${retryAfter} within window`);
+});
+
 // ─────────────────────── handler factory ────────────────────────
 
 test('createHandler: preflight, happy path, rate limit, error → 500, onError', async () => {
