@@ -449,7 +449,22 @@ function pruneBuckets(now, windowMs) {
   for (const [k, b] of buckets) {
     if (now - b.windowStart >= windowMs) buckets.delete(k);
   }
-  if (buckets.size > MAX_KEYS) buckets.clear();
+  // Still over the cap after dropping expired windows means a high-cardinality
+  // flood of distinct keys (rotated IPs / junk headers). Evict least-recently-
+  // used entries down to the cap — NEVER clear() the whole map. A global clear
+  // let one flood zero out every honest user's mid-window counter, briefly
+  // opening every endpoint for everyone (and letting an abuser escape their own
+  // limit by flooding from other IPs). LRU eviction targets idle keys, so a
+  // client that stays active through the flood keeps its counter — you cannot
+  // lift your own active limit by flooding. (This per-instance limiter is
+  // best-effort; checkRateLimitDistributed is the real cross-instance defense.)
+  if (buckets.size > MAX_KEYS) {
+    const excess = buckets.size - MAX_KEYS;
+    const lru = [...buckets.entries()]
+      .sort((a, b) => a[1].lastSeen - b[1].lastSeen)
+      .slice(0, excess);
+    for (const [k] of lru) buckets.delete(k);
+  }
 }
 
 /** Core check. Returns { ok: true } or { ok: false, retryAfter } (seconds,
@@ -458,10 +473,13 @@ function checkWindow(name, ip, max, windowMs, now) {
   const key = `${name}:${ip}`;
   let b = buckets.get(key);
   if (!b || now - b.windowStart >= windowMs) {
-    b = { windowStart: now, count: 0 };
+    b = { windowStart: now, count: 0, lastSeen: now };
     buckets.set(key, b);
   }
   b.count++;
+  b.lastSeen = now; // for LRU eviction under a cardinality flood
+  // The just-served key is now MRU, so pruneBuckets can never evict the very
+  // bucket this call is counting against.
   if (buckets.size > MAX_KEYS) pruneBuckets(now, windowMs);
   if (b.count > max) {
     return { ok: false, retryAfter: Math.max(1, Math.ceil((b.windowStart + windowMs - now) / 1000)) };
@@ -569,9 +587,13 @@ export function clientIp(event) {
 /** Fixed-window check. Returns `{ ok: true }` under the limit, or
  *  `{ ok: false, retryAfter }` (seconds) once `max` is exceeded within
  *  `windowMs`. Fails open by construction. Shares the bucket store with
- *  checkRateLimit (namespaced by `name`, so counts never collide). */
+ *  checkRateLimit (namespaced by `name`, so counts never collide).
+ *  Keys on the IP_RE-validated IP (via extractIp), same as checkRateLimit —
+ *  so a caller-controlled junk `x-forwarded-for` can't mint unbounded bucket
+ *  keys (cardinality-flood amplification) and unparseable IPs collapse into
+ *  one shared 'unknown' bucket rather than each getting their own. */
 export function rateLimit(event, { name, windowMs, max }, now = Date.now()) {
-  return checkWindow(name, clientIp(event), max, windowMs, now);
+  return checkWindow(name, extractIp(event), max, windowMs, now);
 }
 
 /** Test-only reset of ALL in-memory limiter state (both calling forms —
