@@ -344,6 +344,38 @@ test('checkRateLimit: Retry-After reflects time left in the window', () => {
   assert.ok(retryAfter >= 1 && retryAfter <= 10, `Retry-After ${retryAfter} within window`);
 });
 
+test('limiter: a cardinality flood evicts idle keys via LRU, never wipes an active counter', () => {
+  _resetRateLimit();
+  const W = 60_000, name = 'ep', max = 3;
+  const flood = (n, t, base) => {
+    for (let i = 0; i < n; i++) {
+      const ip = `${base}.${(i >> 16) & 255}.${(i >> 8) & 255}.${i & 255}`;
+      rateLimit(eventWith({ headers: { 'x-nf-client-connection-ip': ip } }), { name, windowMs: W, max }, t);
+    }
+  };
+  const active = eventWith({ headers: { 'x-nf-client-connection-ip': '9.9.9.9' } });
+  // Background flood populates the map with many now-idle keys at t.
+  flood(5100, 1_000_000, '10');
+  // The active client burns its budget slightly later — now the MRU entries.
+  for (let k = 0; k < max; k++) assert.equal(rateLimit(active, { name, windowMs: W, max }, 1_000_001).ok, true);
+  assert.equal(rateLimit(active, { name, windowMs: W, max }, 1_000_001).ok, false); // limited
+  // A second wave forces eviction: LRU drops the idle t-flood, NOT the active
+  // client (pre-fix, buckets.clear() would have reset it to a fresh window).
+  flood(300, 1_000_002, '11');
+  assert.equal(rateLimit(active, { name, windowMs: W, max }, 1_000_003).ok, false, 'active client stays limited across the flood');
+});
+
+test('rateLimit validates the IP (no junk-header bucket minting / poisoning)', () => {
+  _resetRateLimit();
+  // No x-nf-client-connection-ip → falls back to the client-controlled header.
+  // A junk value must collapse to the shared "unknown" bucket, not mint its own.
+  const junkA = eventWith({ headers: { 'x-forwarded-for': 'not-an-ip-<script>' } });
+  const junkB = eventWith({ headers: { 'x-forwarded-for': 'also~garbage' } });
+  assert.equal(rateLimit(junkA, { name: 'feed', windowMs: 60_000, max: 1 }, 1).ok, true);
+  // Different junk header, SAME 'unknown' bucket → second call is over the max.
+  assert.equal(rateLimit(junkB, { name: 'feed', windowMs: 60_000, max: 1 }, 2).ok, false);
+});
+
 // ─────────────────────── handler factory ────────────────────────
 
 test('createHandler: preflight, happy path, rate limit, error → 500, onError', async () => {
