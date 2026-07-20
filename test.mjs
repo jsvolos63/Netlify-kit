@@ -3,6 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import {
   corsHeaders,
   handlePreflight,
@@ -33,6 +34,7 @@ import {
   isPrivateIPv6,
   isPrivateAddress,
   resolveHostIsPublic,
+  safeFetch,
   fetchWithRetry,
   RETRYABLE_STATUSES,
   clientIp,
@@ -221,6 +223,21 @@ test('parseSafeHttpsUrl: accepts public https, rejects the rest', () => {
   assert.ok(isSafeHttpsUrl('https://example.com'));
 });
 
+test('parseSafeHttpsUrl: trailing-dot hosts and non-dotted-decimal IP encodings are rejected', () => {
+  // A single trailing dot (the DNS root) must not slip past the localhost /
+  // internal-suffix checks.
+  assert.equal(parseSafeHttpsUrl('https://localhost./').error, 'disallowed-host');
+  assert.equal(parseSafeHttpsUrl('https://foo.internal./').error, 'disallowed-host');
+  assert.equal(parseSafeHttpsUrl('https://bar.local./').error, 'disallowed-host');
+  assert.equal(parseSafeHttpsUrl('https://baz.lan./').error, 'disallowed-host');
+  // Non-dotted-decimal IPv4 encodings that resolvers accept as 127.0.0.1.
+  assert.equal(parseSafeHttpsUrl('https://2130706433/').error, 'disallowed-host'); // decimal
+  assert.equal(parseSafeHttpsUrl('https://0x7f000001/').error, 'disallowed-host'); // hex
+  assert.equal(parseSafeHttpsUrl('https://0177.0.0.1/').error, 'disallowed-host'); // octal
+  // A trailing dot on a real public host is still fine.
+  assert.ok(parseSafeHttpsUrl('https://example.com./').ok);
+});
+
 test('private IP helpers', () => {
   for (const ip of ['10.0.0.1', '127.0.0.1', '169.254.169.254', '192.168.1.1', '172.16.5.5', '100.64.0.1'])
     assert.ok(isPrivateIPv4(ip), ip);
@@ -237,6 +254,88 @@ test('resolveHostIsPublic: localhost is private (fail closed)', async () => {
   const r = await resolveHostIsPublic('localhost');
   assert.equal(r.ok, false);
   assert.equal(r.error, 'private-ip');
+});
+
+// safeFetch is exercised against a local http.createServer. Production always
+// speaks HTTPS to a vetted public IP; the `_validate` / `_resolve` seams let the
+// test permit its own loopback origin while REDIRECT targets still go through
+// the real parseSafeHttpsUrl + a private-IP-aware resolver, proving each hop is
+// re-vetted.
+async function withServer(handler, run) {
+  const server = http.createServer(handler);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  const origin = `http://127.0.0.1:${port}`;
+  // Permit the test's own origin; defer to the real HTTPS guard for anything
+  // else (i.e. redirect Locations).
+  const _validate = (u) => {
+    const url = new URL(u);
+    return url.origin === origin ? { ok: true, url, error: null } : parseSafeHttpsUrl(u);
+  };
+  // Loopback for our server host; a private verdict for the rebind bait host.
+  const _resolve = async (host) => {
+    if (host === '127.0.0.1') return { ok: true, address: '127.0.0.1', family: 4 };
+    if (host === 'private.example') return { ok: false, error: 'private-ip' };
+    return { ok: false, error: 'dns-failed' };
+  };
+  try {
+    return await run({ origin, _validate, _resolve });
+  } finally {
+    server.close();
+  }
+}
+
+test('safeFetch: a normal 200 succeeds and returns a Response-like object', async () => {
+  await withServer(
+    (req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('hello-body');
+    },
+    async ({ origin, _validate, _resolve }) => {
+      const r = await safeFetch(`${origin}/ok`, { _validate, _resolve });
+      assert.equal(r.ok, true);
+      assert.equal(r.status, 200);
+      assert.equal(await r.text(), 'hello-body');
+      assert.equal(r.headers.get('content-type'), 'text/plain');
+      assert.equal(r.url, `${origin}/ok`);
+    },
+  );
+});
+
+test('safeFetch: a redirect to http:// is rejected (no downgrade)', async () => {
+  await withServer(
+    (req, res) => { res.writeHead(302, { location: 'http://127.0.0.1/' }); res.end(); },
+    async ({ origin, _validate, _resolve }) => {
+      await assert.rejects(
+        safeFetch(`${origin}/red`, { _validate, _resolve }),
+        (e) => /blocked-url:not-https/.test(e.message),
+      );
+    },
+  );
+});
+
+test('safeFetch: a redirect to a private host is re-vetted and rejected', async () => {
+  await withServer(
+    (req, res) => { res.writeHead(302, { location: 'https://private.example/' }); res.end(); },
+    async ({ origin, _validate, _resolve }) => {
+      await assert.rejects(
+        safeFetch(`${origin}/red`, { _validate, _resolve }),
+        (e) => /blocked-host:private-ip/.test(e.message),
+      );
+    },
+  );
+});
+
+test('safeFetch: the redirect hop cap is enforced', async () => {
+  await withServer(
+    (req, res) => { res.writeHead(302, { location: '/loop' }); res.end(); },
+    async ({ origin, _validate, _resolve }) => {
+      await assert.rejects(
+        safeFetch(`${origin}/loop`, { _validate, _resolve, maxRedirects: 3 }),
+        (e) => /too-many-redirects/.test(e.message),
+      );
+    },
+  );
 });
 
 // ──────────────────────────── retry ─────────────────────────────
@@ -299,6 +398,73 @@ test('checkRateLimitDistributed: degrades to in-memory without blobs', async () 
   assert.equal(await checkRateLimitDistributed(ev, 1, 60_000), null);
   const blocked = await checkRateLimitDistributed(ev, 1, 60_000);
   assert.equal(blocked.statusCode, 429);
+});
+
+// Blobs-shaped mock with etag/CAS semantics + a knob to force the first N
+// conditional writes to lose the race (simulating a concurrent writer).
+function casStore({ conflicts = 0 } = {}) {
+  const m = new Map();
+  const tags = new Map();
+  let remaining = conflicts;
+  let ver = 0;
+  const deletes = [];
+  return {
+    getWithMetadata: async (k) => (m.has(k)
+      ? { data: m.get(k), etag: tags.get(k) }
+      : { data: null, etag: null }),
+    setJSON: async (k, v, o = {}) => {
+      if (remaining > 0) { remaining -= 1; return { modified: false }; } // lost CAS
+      if (o.onlyIfNew && m.has(k)) return { modified: false };
+      if (o.onlyIfMatch && o.onlyIfMatch !== (tags.get(k) || null)) return { modified: false };
+      ver += 1;
+      const et = `e${ver}`;
+      m.set(k, JSON.parse(JSON.stringify(v)));
+      tags.set(k, et);
+      return { modified: true, etag: et };
+    },
+    delete: async (k) => { deletes.push(k); m.delete(k); tags.delete(k); },
+    _map: m,
+    _deletes: deletes,
+  };
+}
+
+test('checkRateLimitDistributed (CAS): counts, denies over max, prunes the prior window', async () => {
+  const store = casStore();
+  const ev = eventWith({ headers: { 'x-forwarded-for': '8.8.8.8' } });
+  // Pre-seed a prior-window key so we can prove it gets pruned on a successful write.
+  const now = Date.now();
+  const windowMs = 60_000;
+  const windowStart = Math.floor(now / windowMs) * windowMs;
+  store._map.set(`rl:8.8.8.8:${windowStart - windowMs}`, { count: 9 });
+
+  assert.equal(await checkRateLimitDistributed(ev, 2, windowMs, { store }), null); // 1
+  assert.ok(store._deletes.includes(`rl:8.8.8.8:${windowStart - windowMs}`), 'prior window pruned');
+  assert.equal(await checkRateLimitDistributed(ev, 2, windowMs, { store }), null); // 2
+  const blocked = await checkRateLimitDistributed(ev, 2, windowMs, { store });     // 3 > 2
+  assert.equal(blocked.statusCode, 429);
+});
+
+test('checkRateLimitDistributed (CAS): retries a conflicting write, then succeeds', async () => {
+  const store = casStore({ conflicts: 1 }); // first write loses, retry wins
+  const ev = eventWith({ headers: { 'x-forwarded-for': '8.8.4.4' } });
+  assert.equal(await checkRateLimitDistributed(ev, 5, 60_000, { store, retries: 3 }), null);
+});
+
+test('checkRateLimitDistributed (CAS): exhausted conflicts fail closed (deny)', async () => {
+  const store = casStore({ conflicts: 99 }); // every write loses
+  const ev = eventWith({ headers: { 'x-forwarded-for': '8.8.1.1' } });
+  const r = await checkRateLimitDistributed(ev, 100, 60_000, { store, retries: 2 });
+  assert.equal(r.statusCode, 429); // fail-closed, not silently permitted
+});
+
+test('checkRateLimitDistributed: read error falls back by default, denies when failClosed', async () => {
+  const boom = { getWithMetadata: async () => { throw new Error('blobs down'); } };
+  const ev = eventWith({ headers: { 'x-forwarded-for': '8.8.2.2' } });
+  // Default: fall back to the in-memory limiter (permits the first hit).
+  assert.equal(await checkRateLimitDistributed(ev, 1, 60_000, { store: boom }), null);
+  // failClosed: deny on the read error instead of falling back.
+  const r = await checkRateLimitDistributed(ev, 1, 60_000, { store: boom, failClosed: true });
+  assert.equal(r.statusCode, 429);
 });
 
 test('rateLimit (Surf form): { ok, retryAfter } with injected clock', () => {
