@@ -271,9 +271,32 @@ export function parseSafeHttpsUrl(input) {
   if (url.port && url.port !== '443') return { ok: false, error: 'bad-port', url: null };
   if (url.username || url.password) return { ok: false, error: 'has-credentials', url: null };
 
-  const host = url.hostname.toLowerCase();
+  let host = url.hostname.toLowerCase();
+  // A single trailing dot is the DNS root and is stripped by resolvers, so
+  // `localhost.` / `foo.internal.` resolve exactly like their dotless form —
+  // yet would sail past the equality/suffix checks below. Normalize it away.
+  if (host.endsWith('.')) host = host.slice(0, -1);
+
+  const labels = host.split('.');
+  // Non-dotted-decimal IPv4 encodings — a bare decimal integer (2130706433), a
+  // hex form (0x7f000001), or per-octet octal (0177.0.0.1) — are all accepted
+  // by many resolvers as 127.0.0.1 but slip past a plain dotted-decimal literal
+  // check. A real public host always ends in an alphabetic TLD, so a host whose
+  // labels are ALL numeric/hex/octal is an IP literal in disguise: reject it.
+  const numericLabel = (l) => /^\d+$/.test(l) || /^0x[0-9a-f]*$/i.test(l);
+  const looksLikeNumericIp =
+    labels.length > 0 &&
+    labels.every(numericLabel) &&
+    (
+      labels.length === 1 ||                            // 2130706433, 0x7f000001
+      labels.some((l) => /^0x/i.test(l) || /^0\d/.test(l)) // hex or leading-zero octal octet
+    );
+
   const isIpLiteral =
-    /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':') || host.startsWith('[');
+    /^\d{1,3}(\.\d{1,3}){3}$/.test(host) ||
+    host.includes(':') ||
+    host.startsWith('[') ||
+    looksLikeNumericIp;
   if (
     isIpLiteral ||
     host === 'localhost' ||
@@ -345,29 +368,205 @@ export function isPrivateAddress(address, family) {
   return family === 6 ? isPrivateIPv6(address) : isPrivateIPv4(address);
 }
 
-/** Resolve `hostname` and return `{ ok: true }` only if every resolved address
- *  is in a public range. A DNS failure or empty result is treated as not-ok
- *  (fail closed) — refuse a name we can't vet rather than fetch it blind. */
-export async function resolveHostIsPublic(hostname) {
+/** Resolve `hostname` to every A/AAAA address once (fail-closed on any error or
+ *  empty result). Shared by resolveHostIsPublic and safeFetch's pin step so the
+ *  vetting and the address we connect to come from a single lookup. */
+async function _dnsLookupAll(hostname) {
   let dns;
   try {
     ({ promises: dns } = await import('node:dns'));
   } catch {
-    return { ok: false, error: 'dns-unavailable' };
+    return { ok: false, error: 'dns-unavailable', addrs: null };
   }
   let addrs;
   try {
     addrs = await dns.lookup(hostname, { all: true, verbatim: true });
   } catch {
-    return { ok: false, error: 'dns-failed' };
+    return { ok: false, error: 'dns-failed', addrs: null };
   }
-  if (!addrs || !addrs.length) return { ok: false, error: 'dns-empty' };
-  for (const { address, family } of addrs) {
+  if (!addrs || !addrs.length) return { ok: false, error: 'dns-empty', addrs: null };
+  return { ok: true, error: null, addrs };
+}
+
+/** Resolve `hostname` and return `{ ok: true }` only if every resolved address
+ *  is in a public range. A DNS failure or empty result is treated as not-ok
+ *  (fail closed) — refuse a name we can't vet rather than fetch it blind. */
+export async function resolveHostIsPublic(hostname) {
+  const r = await _dnsLookupAll(hostname);
+  if (!r.ok) return { ok: false, error: r.error };
+  for (const { address, family } of r.addrs) {
     if (isPrivateAddress(address, family)) {
       return { ok: false, error: 'private-ip', address };
     }
   }
   return { ok: true, error: null };
+}
+
+/** Vet a hostname like resolveHostIsPublic, but also return a concrete public
+ *  address to pin the socket to. Every resolved address must be public (so an
+ *  attacker can't hide a private A record behind a public one); the first is
+ *  returned as the connect target. Fail-closed. */
+async function _resolveVettedAddress(hostname) {
+  const r = await _dnsLookupAll(hostname);
+  if (!r.ok) return { ok: false, error: r.error };
+  for (const { address, family } of r.addrs) {
+    if (isPrivateAddress(address, family)) return { ok: false, error: 'private-ip', address };
+  }
+  const first = r.addrs[0];
+  return { ok: true, error: null, address: first.address, family: first.family };
+}
+
+// Adapt a Node IncomingMessage into the minimal `{ headers.get, body.getReader }`
+// shape readTextCapped consumes, so the streamed size cap applies to safeFetch
+// bodies exactly as it does to global-fetch Response bodies.
+function _nodeCapAdapter(res) {
+  const iter = res[Symbol.asyncIterator]();
+  return {
+    headers: {
+      get: (k) => {
+        const v = res.headers[String(k).toLowerCase()];
+        return v == null ? null : String(v);
+      },
+    },
+    body: {
+      getReader() {
+        return {
+          read: async () => {
+            const { done, value } = await iter.next();
+            return done ? { done: true, value: undefined } : { done: false, value };
+          },
+          cancel: async () => { res.destroy(); },
+        };
+      },
+    },
+  };
+}
+
+// Issue one request over node:http/https, connecting to the pre-vetted IP via a
+// pinned `lookup` while keeping the real hostname for the Host header and TLS
+// SNI (servername). Resolves with the IncomingMessage once headers arrive.
+async function _requestPinned(target, vetted, { method, headers, deadline }) {
+  const isHttps = target.protocol === 'https:';
+  const mod = isHttps ? await import('node:https') : await import('node:http');
+  const port = target.port ? Number(target.port) : (isHttps ? 443 : 80);
+  return new Promise((resolve, reject) => {
+    const opts = {
+      method: method || 'GET',
+      hostname: target.hostname,
+      port,
+      path: (target.pathname || '/') + (target.search || ''),
+      headers: { host: target.host, ...headers },
+      // Pin the connection to the address we vetted — the DNS-rebinding fix:
+      // a second resolution (by the socket) can't swap in a private IP.
+      lookup: (_h, _o, cb) => cb(null, vetted.address, vetted.family),
+    };
+    if (isHttps) opts.servername = target.hostname; // correct SNI to the pinned IP
+    const req = mod.request(opts, resolve);
+    const budget = Math.max(1, deadline - Date.now());
+    req.setTimeout(budget, () => req.destroy(new Error('safeFetch: request timed out')));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/**
+ * DNS-rebinding-safe HTTPS fetch for caller-supplied URLs, with per-hop SSRF
+ * re-validation. Every URL — the initial one and every redirect Location — is
+ * run through `parseSafeHttpsUrl` (HTTPS only, no IP literals / internal hosts,
+ * so an `http:` downgrade is rejected) and then resolved + vetted so no name
+ * pointing at a private / link-local / loopback address is ever fetched. The
+ * socket connects to the exact address that vetting approved (pinned via the
+ * `lookup` option) while preserving the hostname for the Host header and TLS
+ * SNI, closing the resolve-then-connect (TOCTOU) rebinding window. Redirects
+ * are followed manually and capped; the whole call is bounded by a total
+ * timeout and the body is read through `readTextCapped` (size-capped).
+ *
+ * @param {string} url  initial URL (must be public HTTPS).
+ * @param {object} [init]
+ *   - method     {string}  HTTP method (default 'GET'). No request body is sent.
+ *   - headers    {object}  extra request headers.
+ *   - timeoutMs  {number}  total budget across all hops (default 10000).
+ *   - maxRedirects {number} max 3xx hops to follow (default 5).
+ *   - maxBytes   {number}  response body cap (default MAX_RESPONSE_BYTES).
+ * @returns {Promise<{ ok:boolean, status:number, headers:{get(name):?string,
+ *   raw:object}, url:string, text():Promise<string> }>} a small Response-like
+ *   object: `ok` (2xx), final `status`, case-insensitive `headers.get()` (+ the
+ *   raw header object), the final `url` after redirects, and a `text()` that
+ *   resolves the already-read, size-capped body.
+ * @throws on a blocked URL/host, a redirect past the cap, a timeout, or a
+ *   transport error — callers get a hard failure rather than a blind fetch.
+ *
+ * Residual note: the pinned-IP path is always preferred. `_validate`/`_resolve`
+ * are internal seams (used by the tests) — production calls always use the real
+ * `parseSafeHttpsUrl` + `_resolveVettedAddress`, which re-resolve and re-vet
+ * immediately before every connection.
+ */
+export async function safeFetch(url, init = {}) {
+  const {
+    method = 'GET',
+    headers = {},
+    timeoutMs = 10_000,
+    maxRedirects = 5,
+    maxBytes = MAX_RESPONSE_BYTES,
+    _validate = parseSafeHttpsUrl,
+    _resolve = _resolveVettedAddress,
+  } = init || {};
+  const deadline = Date.now() + Math.max(1, timeoutMs);
+  let currentUrl = String(url);
+  let hops = 0;
+
+  for (;;) {
+    const parsed = _validate(currentUrl);
+    if (!parsed || !parsed.ok) {
+      throw new Error(`safeFetch: blocked-url:${(parsed && parsed.error) || 'invalid'}`);
+    }
+    const target = parsed.url;
+    const vetted = await _resolve(target.hostname);
+    if (!vetted || !vetted.ok) {
+      throw new Error(`safeFetch: blocked-host:${(vetted && vetted.error) || 'unresolved'}`);
+    }
+    if (Date.now() >= deadline) throw new Error('safeFetch: timeout');
+
+    const res = await _requestPinned(target, vetted, { method, headers, deadline });
+    const status = res.statusCode || 0;
+    const location = res.headers.location;
+
+    if (status >= 300 && status < 400 && location) {
+      res.resume(); // drain the redirect body to free the socket
+      if (hops >= maxRedirects) { res.destroy(); throw new Error('safeFetch: too-many-redirects'); }
+      hops += 1;
+      currentUrl = new URL(location, currentUrl).toString(); // re-vetted next iteration
+      continue;
+    }
+
+    let timer;
+    let bodyText;
+    try {
+      const budget = Math.max(1, deadline - Date.now());
+      bodyText = await Promise.race([
+        readTextCapped(_nodeCapAdapter(res), maxBytes),
+        new Promise((_, rej) => {
+          timer = setTimeout(() => { res.destroy(); rej(new Error('safeFetch: body timeout')); }, budget);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    const finalHeaders = {
+      get: (k) => {
+        const v = res.headers[String(k).toLowerCase()];
+        return v == null ? null : String(v);
+      },
+      raw: { ...res.headers },
+    };
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      headers: finalHeaders,
+      url: currentUrl,
+      text: async () => bodyText,
+    };
+  }
 }
 
 // ──────────────────────────── retry ─────────────────────────────
@@ -538,36 +737,79 @@ function getRateStore() {
 
 /** Async distributed rate-limit check. Returns a 429 / 414 response object, or
  *  null if allowed. Falls back transparently to `checkRateLimit` when the
- *  Blobs store is unavailable. */
-export async function checkRateLimitDistributed(event, max = 60, windowMs = 60_000) {
+ *  Blobs store is unavailable.
+ *
+ *  The counter is incremented with optimistic concurrency (compare-and-set):
+ *  read `{ count }` + its etag, compute the next value, then write it back
+ *  conditionally (`onlyIfMatch` on update, `onlyIfNew` on create). A losing
+ *  writer (the etag moved) retries with a fresh read. This closes the
+ *  read-modify-write race where two concurrent instances both read count=N and
+ *  each write N+1, letting a client exceed the limit. If every retry conflicts
+ *  we DENY (fail-closed) rather than silently permit — under contention that
+ *  heavy the endpoint is exactly what the limiter is meant to protect.
+ *
+ *  opts:
+ *   - failClosed {boolean} default false. A read/store error normally falls
+ *     back to the in-memory limiter (previous behavior); when true it denies.
+ *     Write-conflict exhaustion ALWAYS denies regardless of this flag.
+ *   - retries    {number}  CAS retry budget (default 5).
+ *   - store      {object}  test seam: inject a Blobs-shaped store. */
+export async function checkRateLimitDistributed(event, max = 60, windowMs = 60_000, opts = {}) {
+  const { failClosed = false, retries = 5, store: injectedStore = null } = opts || {};
   const qs = event.rawQuery || event.rawQueryString || '';
   if (typeof qs === 'string' && qs.length > MAX_QUERY_LENGTH) {
     return queryTooLongResponse();
   }
 
-  const store = await getRateStore();
+  const store = injectedStore || await getRateStore();
   if (!store) return checkRateLimit(event, max, windowMs);
 
   const ip = extractIp(event);
   const now = Date.now();
   const windowStart = Math.floor(now / windowMs) * windowMs;
   const key = `rl:${ip}:${windowStart}`;
+  const denied = () =>
+    tooManyRequestsResponse(Math.max(1, Math.ceil((windowStart + windowMs - now) / 1000)));
 
-  let entry = null;
-  try {
-    entry = await store.get(key, { type: 'json' });
-  } catch {
-    return checkRateLimit(event, max, windowMs);
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    let data = null;
+    let etag = null;
+    try {
+      const meta = await store.getWithMetadata(key, { type: 'json' });
+      data = (meta && meta.data) || null;
+      etag = (meta && meta.etag) || null;
+    } catch {
+      // Read/store failure: fall back to the in-memory limiter (default), or
+      // deny when the caller asked to fail closed.
+      return failClosed ? denied() : checkRateLimit(event, max, windowMs);
+    }
+
+    const count = (data?.count || 0) + 1;
+    if (count > max) return denied();
+
+    const val = { count, expiresAt: windowStart + windowMs * 2 };
+    const writeOpts = etag ? { onlyIfMatch: etag } : { onlyIfNew: true };
+    let writeRes;
+    try {
+      writeRes = await store.setJSON(key, val, writeOpts);
+    } catch {
+      // A thrown write (network/store error, not a CAS conflict) is best-effort:
+      // permit by default, deny only when failing closed.
+      return failClosed ? denied() : null;
+    }
+
+    // Conditional writes report `{ modified: false }` when the precondition
+    // failed — i.e. another instance wrote first. Re-read and retry.
+    if (writeRes && writeRes.modified === false) continue;
+
+    // Success. Best-effort delete the previous window's key so idle buckets
+    // don't accumulate unbounded in the store.
+    try { await store.delete(`rl:${ip}:${windowStart - windowMs}`); } catch { /* best effort */ }
+    return null;
   }
 
-  const count = (entry?.count || 0) + 1;
-  if (count > max) {
-    return tooManyRequestsResponse(Math.max(1, Math.ceil((windowStart + windowMs - now) / 1000)));
-  }
-  try {
-    await store.setJSON(key, { count, expiresAt: windowStart + windowMs * 2 });
-  } catch { /* better to permit than to error out */ }
-  return null;
+  // Every attempt lost the CAS race — persistent contention. Fail closed.
+  return denied();
 }
 
 /** Test seam: reset the cached Blobs store promise so tests can stub it. */
