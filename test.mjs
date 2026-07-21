@@ -338,6 +338,18 @@ test('safeFetch: the redirect hop cap is enforced', async () => {
   );
 });
 
+test('safeFetch: a hung DNS resolve is bounded by the deadline', async () => {
+  // A _resolve that never settles must not hang safeFetch past timeoutMs.
+  const hang = () => new Promise(() => {});
+  const _validate = (u) => ({ ok: true, url: new URL(u), error: null });
+  const start = Date.now();
+  await assert.rejects(
+    safeFetch('https://slow.example/x', { _validate, _resolve: hang, timeoutMs: 60 }),
+    (e) => /timeout/.test(e.message),
+  );
+  assert.ok(Date.now() - start < 2000, 'rejected promptly rather than hanging');
+});
+
 // ──────────────────────────── retry ─────────────────────────────
 
 const noSleep = async () => {};
