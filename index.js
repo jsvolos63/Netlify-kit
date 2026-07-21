@@ -521,7 +521,23 @@ export async function safeFetch(url, init = {}) {
       throw new Error(`safeFetch: blocked-url:${(parsed && parsed.error) || 'invalid'}`);
     }
     const target = parsed.url;
-    const vetted = await _resolve(target.hostname);
+    // Bound the DNS resolve by the remaining deadline: getaddrinfo has no
+    // timeout of its own, so without this a hostile authoritative nameserver
+    // (one per redirect hop) could stall each lookup indefinitely past
+    // timeoutMs. The losing lookup keeps running but is ignored.
+    let dnsTimer;
+    let vetted;
+    try {
+      const dnsBudget = Math.max(1, deadline - Date.now());
+      vetted = await Promise.race([
+        _resolve(target.hostname),
+        new Promise((_, rej) => {
+          dnsTimer = setTimeout(() => rej(new Error('safeFetch: timeout')), dnsBudget);
+        }),
+      ]);
+    } finally {
+      clearTimeout(dnsTimer);
+    }
     if (!vetted || !vetted.ok) {
       throw new Error(`safeFetch: blocked-host:${(vetted && vetted.error) || 'unresolved'}`);
     }
@@ -793,9 +809,12 @@ export async function checkRateLimitDistributed(event, max = 60, windowMs = 60_0
     try {
       writeRes = await store.setJSON(key, val, writeOpts);
     } catch {
-      // A thrown write (network/store error, not a CAS conflict) is best-effort:
-      // permit by default, deny only when failing closed.
-      return failClosed ? denied() : null;
+      // A thrown write (network/store outage, not a CAS conflict) means we can't
+      // persist the increment. Mirror the read-error path: fall back to the
+      // in-memory limiter (still throttles per-instance) by default, or deny when
+      // the caller asked to fail closed — never blanket-allow, which would let a
+      // write-only Blobs degradation bypass the limit entirely.
+      return failClosed ? denied() : checkRateLimit(event, max, windowMs);
     }
 
     // Conditional writes report `{ modified: false }` when the precondition
