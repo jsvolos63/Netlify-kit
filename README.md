@@ -66,6 +66,15 @@ else `null`), `preflightResponse(opts)` (unconditional 204 advertising verbs).
 - `textResponse(statusCode, body, opts?)`.
 - `ok`, `badRequest`, `notFound`, `methodNotAllowed`, `serverError`,
   `badGateway`, `upstreamError(status, err, extraHeaders?)` — named sugar.
+- `createResponders({ cors? })` — the full helper set above as a configured
+  bundle. Default (`cors: true`) is byte-identical to the module-level exports;
+  `createResponders({ cors: false })` returns the same shapes with **zero
+  `Access-Control-*` headers** — for endpoints that must stay unreadable to
+  cross-origin scripts (per-query-billed upstream proxies, e.g. FlightCheck's
+  AeroAPI/Maps functions, which previously re-implemented every helper plus a
+  `stripCors()` scrubber). Status/body/content-type/`nosniff`/cache-control/
+  extraHeaders behavior is unchanged; the status-first `jsonResponse` /
+  `textResponse` forms still honor an explicit per-call `opts.corsOrigin`.
 - `errorMessage(err, max=200)` — bounded stringification.
 - `checkResponseSize(response, headers?)` — pre-read 502 guard from
   `content-length`. `readTextCapped(res, maxBytes)` — streamed UTF-8 read that
@@ -96,11 +105,23 @@ like `2130706433` / `0x7f000001` / `0177.0.0.1` — no `localhost`/`.internal`/
 **Retry** — `fetchWithRetry(url, init, opts)` (exp backoff + full jitter;
 retries network errors + 502/503/504, 429 only with `retryOn429`; injectable
 `fetchFn`/`sleepFn`/`rng`), `RETRYABLE_STATUSES`.
+- `opts.retries: 0` performs **exactly one attempt** (no backoff machinery),
+  and `opts.attemptTimeoutMs` gives **each attempt its own AbortSignal
+  deadline** — distinct from an overall budget passed as `init.signal` (e.g.
+  `AbortSignal.timeout(...)`, which spans all attempts and aborts terminally).
+  A fired per-attempt deadline throws a retryable Error tagged
+  `name: 'TimeoutError'` / `.timedOut = true` (with `retries: 0` it surfaces
+  immediately); a caller-signal abort stays terminal. Together they cover the
+  billed-upstream shape (never retry a per-query-billed request, but bound the
+  one attempt — FlightCheck's `fetchWithTimeout`), while omitting
+  `attemptTimeoutMs` leaves existing callers byte-identical.
 
 **Rate limiting**
-- `checkRateLimit(event, max, windowMs)` / `checkRateLimitDistributed(...)`
+- `checkRateLimit(event, max, windowMs, opts?)` / `checkRateLimitDistributed(...)`
   (async, Netlify Blobs with in-memory fallback) — return a ready 429/414
-  response or `null`. `_resetStoreCache()` test seam. `MAX_QUERY_LENGTH`.
+  response or `null`. `opts.cors: false` strips the `Access-Control-*` headers
+  off the 429/414 shapes (matching `createResponders`); `Retry-After` and
+  `nosniff` survive. `_resetStoreCache()` test seam. `MAX_QUERY_LENGTH`.
 - `rateLimit(event, { name, windowMs, max })` → `{ ok, retryAfter }` low-level
   check. `clientIp(event)`. `_resetRateLimit()` test seam.
 
@@ -120,7 +141,12 @@ distributed limiter) and no-op on failure (a null store reads as a miss).
   without expiry.
 - `blobKey(...parts)` → stable `|`-joined key (nullish parts blank).
 
-**Handler** — `createHandler({ name, rateLimit, distributed, handle, onError })`.
+**Handler** — `createHandler({ name, rateLimit, distributed, cors, handle,
+onError })`. `cors: false` (default `true`) makes every response the wrapper
+itself emits CORS-free: the OPTIONS short-circuit becomes a bare 204, and the
+limiter's 429/414 plus the catch-all 500 use the no-CORS shapes — pair it with
+`createResponders({ cors: false })` inside `handle` for a fully CORS-free
+endpoint.
 
 **Anthropic (Claude) client** — hardened Messages-API call machinery,
 consolidated from Surf-Tracker's non-streaming client (`lib/anthropic.js`) and
