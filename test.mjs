@@ -428,6 +428,34 @@ test('safeFetch: a hung DNS resolve is bounded by the deadline', async () => {
   assert.ok(Date.now() - start < 2000, 'rejected promptly rather than hanging');
 });
 
+test('safeFetch: trickled response headers cannot stall past the deadline', async () => {
+  // A server that drips one valid filler header line per interval keeps the
+  // socket ACTIVE forever without ever completing the headers, so an
+  // inactivity-based req.setTimeout() never fires. The headers phase must be
+  // bounded by a hard deadline instead.
+  const net = await import('node:net');
+  const server = net.createServer((sock) => {
+    sock.write('HTTP/1.1 200 OK\r\n');
+    const t = setInterval(() => { try { sock.write('X-Filler: aaaa\r\n'); } catch { /* closing */ } }, 50);
+    sock.on('close', () => clearInterval(t));
+    sock.on('error', () => {});
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  const _validate = (u) => ({ ok: true, url: new URL(u), error: null });
+  const _resolve = async () => ({ ok: true, address: '127.0.0.1', family: 4 });
+  const start = Date.now();
+  try {
+    await assert.rejects(
+      safeFetch(`http://127.0.0.1:${port}/drip`, { _validate, _resolve, timeoutMs: 300 }),
+      (e) => /request timed out/.test(e.message),
+    );
+    assert.ok(Date.now() - start < 5000, 'cut off at the deadline rather than trickling forever');
+  } finally {
+    server.close();
+  }
+});
+
 // ──────────────────────────── retry ─────────────────────────────
 
 const noSleep = async () => {};
@@ -701,6 +729,24 @@ test('rateLimit validates the IP (no junk-header bucket minting / poisoning)', (
   assert.equal(rateLimit(junkA, { name: 'feed', windowMs: 60_000, max: 1 }, 1).ok, true);
   // Different junk header, SAME 'unknown' bucket → second call is over the max.
   assert.equal(rateLimit(junkB, { name: 'feed', windowMs: 60_000, max: 1 }, 2).ok, false);
+});
+
+test('rateLimit: hex-only words and out-of-range octets are NOT IPs (collapse to unknown)', () => {
+  _resetRateLimit();
+  // Every one of these previously passed the IP check and minted its own
+  // bucket key — an unbounded junk-x-forwarded-for cardinality flood. They
+  // must all share the single 'unknown' bucket instead.
+  const junk = ['deadbeef', 'abc', 'cafe', '999.1.1.1', '1.2.3.999'];
+  const opts = { name: 'feed', windowMs: 60_000, max: 1 };
+  const evFor = (v) => eventWith({ headers: { 'x-forwarded-for': v } });
+  assert.equal(rateLimit(evFor(junk[0]), opts, 1).ok, true);
+  for (const v of junk.slice(1)) {
+    assert.equal(rateLimit(evFor(v), opts, 2).ok, false, `"${v}" minted its own bucket`);
+  }
+  // Real IPs still bucket individually.
+  assert.equal(rateLimit(evFor('1.2.3.4'), opts, 3).ok, true);
+  assert.equal(rateLimit(evFor('2001:db8::1'), opts, 3).ok, true);
+  assert.equal(rateLimit(evFor('::1'), opts, 3).ok, true);
 });
 
 test('checkRateLimit / checkRateLimitDistributed: { cors: false } strips CORS off 429 and 414', async () => {
