@@ -81,13 +81,23 @@ export function preflightResponse(opts) {
 
 export const JSON_HEADERS = { 'Content-Type': 'application/json', ...corsHeaders };
 
+// CORS opt-out (createResponders / createHandler's `cors: false`): some
+// endpoints must emit NO Access-Control-* headers at all — FlightCheck's
+// per-query-billed AeroAPI / Google Maps proxies stay unreadable to
+// cross-origin scripts by design, and previously had to re-implement every
+// response helper (plus a stripCors() scrubber for kit-shaped 429s) to get
+// that posture. `X-Content-Type-Options: nosniff` is a content-sniffing
+// guard, not a CORS header, so it stays on either way.
+const NO_CORS_JSON_HEADERS = { 'Content-Type': 'application/json', 'X-Content-Type-Options': 'nosniff' };
+const jsonHeadersFor = (cors) => (cors ? JSON_HEADERS : NO_CORS_JSON_HEADERS);
+
 const JSON_CT_CHARSET = 'application/json; charset=utf-8';
 const TEXT_CT_CHARSET = 'text/plain; charset=utf-8';
 
 // market-monitor form: `jsonResponse(body, cacheControl?, extraHeaders?)` → 200.
 // `body` may be a JS value (stringified) or a pre-serialised JSON string.
-function bodyFirstJson(body, cacheControl, extraHeaders) {
-  const headers = { ...JSON_HEADERS };
+function bodyFirstJson(body, cacheControl, extraHeaders, cors = true) {
+  const headers = { ...jsonHeadersFor(cors) };
   if (cacheControl) headers['Cache-Control'] = cacheControl;
   if (extraHeaders) Object.assign(headers, extraHeaders);
   return {
@@ -98,19 +108,23 @@ function bodyFirstJson(body, cacheControl, extraHeaders) {
 }
 
 // Surf-Tracker form: `jsonResponse(statusCode, obj, opts?)`.
-function statusFirstJson(statusCode, obj, opts) {
+function statusFirstJson(statusCode, obj, opts, cors = true) {
   const o = opts && typeof opts === 'object' ? opts : {};
   const headers = o.headers && typeof o.headers === 'object' ? o.headers : {};
   const cacheControl = typeof o.cacheControl === 'string' ? o.cacheControl : 'no-store';
-  const corsOrigin = typeof o.corsOrigin === 'string' ? o.corsOrigin : '*';
+  const out = {
+    'content-type': JSON_CT_CHARSET,
+    'cache-control': cacheControl,
+  };
+  // With CORS off, the header is only emitted when a caller explicitly asks
+  // for an origin — an explicit per-call opts.corsOrigin always means it.
+  if (cors || typeof o.corsOrigin === 'string') {
+    out['access-control-allow-origin'] = typeof o.corsOrigin === 'string' ? o.corsOrigin : '*';
+  }
+  Object.assign(out, headers);
   return {
     statusCode,
-    headers: {
-      'content-type': JSON_CT_CHARSET,
-      'cache-control': cacheControl,
-      'access-control-allow-origin': corsOrigin,
-      ...headers,
-    },
+    headers: out,
     body: JSON.stringify(obj),
   };
 }
@@ -124,30 +138,41 @@ export function jsonResponse(a, b, c) {
   return typeof a === 'number' ? statusFirstJson(a, b, c) : bodyFirstJson(a, b, c);
 }
 
+function _errorResponse(statusCode, error, extraHeaders, cors = true) {
+  const base = jsonHeadersFor(cors);
+  return {
+    statusCode,
+    headers: extraHeaders ? { ...base, ...extraHeaders } : base,
+    body: JSON.stringify({ error }),
+  };
+}
+
 /** Standard JSON error: `{ error }` body with CORS + content-type + nosniff.
  *  `errorResponse(statusCode, error, extraHeaders?)` (market-monitor form). */
 export function errorResponse(statusCode, error, extraHeaders) {
-  return {
-    statusCode,
-    headers: extraHeaders ? { ...JSON_HEADERS, ...extraHeaders } : JSON_HEADERS,
-    body: JSON.stringify({ error }),
-  };
+  return _errorResponse(statusCode, error, extraHeaders);
+}
+
+function _textResponse(statusCode, body, opts, cors = true) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const headers = o.headers && typeof o.headers === 'object' ? o.headers : {};
+  const out = { 'content-type': TEXT_CT_CHARSET };
+  if (cors || typeof o.corsOrigin === 'string') {
+    out['access-control-allow-origin'] = typeof o.corsOrigin === 'string' ? o.corsOrigin : '*';
+  }
+  Object.assign(out, headers);
+  if (typeof o.cacheControl === 'string') out['cache-control'] = o.cacheControl;
+  return { statusCode, headers: out, body: body == null ? '' : String(body) };
 }
 
 /** Plain-text response, `textResponse(statusCode, body, opts?)` (Surf-Tracker
  *  form). `cache-control` is only emitted when a caller asks for one. */
 export function textResponse(statusCode, body, opts) {
-  const o = opts && typeof opts === 'object' ? opts : {};
-  const headers = o.headers && typeof o.headers === 'object' ? o.headers : {};
-  const corsOrigin = typeof o.corsOrigin === 'string' ? o.corsOrigin : '*';
-  const out = {
-    'content-type': TEXT_CT_CHARSET,
-    'access-control-allow-origin': corsOrigin,
-    ...headers,
-  };
-  if (typeof o.cacheControl === 'string') out['cache-control'] = o.cacheControl;
-  return { statusCode, headers: out, body: body == null ? '' : String(body) };
+  return _textResponse(statusCode, body, opts);
 }
+
+const _clampUpstreamStatus = (status) =>
+  (Number.isInteger(status) && status >= 400 && status <= 599 ? status : 502);
 
 // FlightCheck response sugar — thin, named status shortcuts over the helpers
 // above. (FlightCheck additionally wants `cache-control: no-store` on every
@@ -162,10 +187,37 @@ export const badGateway = (error) => errorResponse(502, error);
 /** Relay an upstream error status, clamped to a valid 4xx/5xx range so an
  *  unexpected upstream value never yields a malformed response. `extraHeaders`
  *  forwards rate-limit hints (e.g. Retry-After). */
-export const upstreamError = (status, err, extraHeaders) => {
-  const safeStatus = Number.isInteger(status) && status >= 400 && status <= 599 ? status : 502;
-  return errorResponse(safeStatus, err, extraHeaders);
-};
+export const upstreamError = (status, err, extraHeaders) =>
+  errorResponse(_clampUpstreamStatus(status), err, extraHeaders);
+
+/**
+ * The full response-helper surface as a configured set. `createResponders()`
+ * (or `{ cors: true }`) returns helpers behaving exactly like the module-level
+ * exports; `createResponders({ cors: false })` returns the same shapes with
+ * ZERO Access-Control-* headers — for endpoints that must stay unreadable to
+ * cross-origin scripts (per-query-billed upstream proxies). Everything else
+ * (status, body, content-type, nosniff, cache-control, extraHeaders merging)
+ * is identical, so a consumer can swap in a no-CORS set without touching call
+ * sites. The status-first `jsonResponse` / `textResponse` forms still honor an
+ * explicit per-call `opts.corsOrigin` even with `cors: false`.
+ */
+export function createResponders(opts) {
+  const cors = !(opts && opts.cors === false);
+  const err = (statusCode, error, extraHeaders) => _errorResponse(statusCode, error, extraHeaders, cors);
+  return {
+    jsonResponse: (a, b, c) =>
+      (typeof a === 'number' ? statusFirstJson(a, b, c, cors) : bodyFirstJson(a, b, c, cors)),
+    errorResponse: err,
+    textResponse: (statusCode, body, o) => _textResponse(statusCode, body, o, cors),
+    ok: (body) => bodyFirstJson(body, undefined, undefined, cors),
+    badRequest: (error) => err(400, error),
+    notFound: (error) => err(404, error),
+    methodNotAllowed: (error = 'Method not allowed.') => err(405, error),
+    serverError: (error) => err(500, error),
+    badGateway: (error) => err(502, error),
+    upstreamError: (status, error, extraHeaders) => err(_clampUpstreamStatus(status), error, extraHeaders),
+  };
+}
 
 /** Safe, bounded stringification of a thrown value for an error body/log. */
 export function errorMessage(e, max = 200) {
@@ -590,6 +642,11 @@ export async function safeFetch(url, init = {}) {
 // Bounded exponential backoff with full jitter around an async fetch. Retries
 // thrown network errors and 502/503/504; 429 only when the caller opts in.
 // Never retries other 4xx, and never an AbortError on the caller's signal.
+//
+// `retries: 0` performs exactly one attempt — no backoff machinery ever runs —
+// which, paired with `attemptTimeoutMs`, is the billed-upstream shape
+// (FlightCheck's AeroAPI / Google Distance Matrix calls: never retry a
+// per-query-billed request, but give the one attempt a hard deadline).
 
 export const RETRYABLE_STATUSES = new Set([502, 503, 504]);
 const DEFAULT_RETRIES = 2; // total attempts = retries + 1
@@ -603,12 +660,45 @@ function fullJitter(attempt, baseMs, capMs, rng) {
   return Math.floor(rng() * exp);
 }
 
+function _attemptTimeoutError(ms) {
+  const e = new Error(`fetchWithRetry: attempt timed out after ${ms}ms`);
+  e.name = 'TimeoutError';
+  e.timedOut = true;
+  return e;
+}
+
+// One fetch attempt under its own AbortController deadline. The caller's
+// init.signal (if any) is mirrored onto the per-attempt controller so a caller
+// abort still cancels the request; a fired deadline surfaces as a tagged
+// TimeoutError (retryable) rather than an AbortError (terminal).
+async function _attemptWithDeadline(fetchFn, url, init, ms) {
+  const ctl = new AbortController();
+  const callerSignal = init && init.signal;
+  const onCallerAbort = () => { try { ctl.abort(callerSignal.reason); } catch { ctl.abort(); } };
+  if (callerSignal) {
+    if (callerSignal.aborted) onCallerAbort();
+    else callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+  }
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, ms);
+  try {
+    return await fetchFn(url, { ...init, signal: ctl.signal });
+  } catch (e) {
+    if (timedOut && !(callerSignal && callerSignal.aborted)) throw _attemptTimeoutError(ms);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    if (callerSignal) callerSignal.removeEventListener('abort', onCallerAbort);
+  }
+}
+
 export async function fetchWithRetry(url, init, opts) {
   const {
     retries = DEFAULT_RETRIES,
     baseMs = DEFAULT_BASE_MS,
     capMs = DEFAULT_CAP_MS,
     retryOn429 = false,
+    attemptTimeoutMs = null,
     sleepFn = _sleep,
     fetchFn = fetch,
     rng = Math.random,
@@ -617,7 +707,9 @@ export async function fetchWithRetry(url, init, opts) {
   let lastErr = null;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const r = await fetchFn(url, init);
+      const r = attemptTimeoutMs == null
+        ? await fetchFn(url, init)
+        : await _attemptWithDeadline(fetchFn, url, init, attemptTimeoutMs);
       const isRetryable = RETRYABLE_STATUSES.has(r.status) || (retryOn429 && r.status === 429);
       if (!isRetryable || attempt === retries) return r;
       try { await r.body?.cancel?.(); } catch { /* best effort */ }
@@ -702,37 +794,40 @@ function checkWindow(name, ip, max, windowMs, now) {
   return { ok: true };
 }
 
-function queryTooLongResponse() {
+function queryTooLongResponse(cors = true) {
   return {
     statusCode: 414,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders },
+    headers: { 'Content-Type': 'application/json', ...(cors ? corsHeaders : { 'X-Content-Type-Options': 'nosniff' }) },
     body: JSON.stringify({ error: 'Query string too long' }),
   };
 }
 
-function tooManyRequestsResponse(retryAfterSeconds) {
+function tooManyRequestsResponse(retryAfterSeconds, cors = true) {
   return {
     statusCode: 429,
     headers: {
       'Content-Type': 'application/json',
       'Retry-After': String(retryAfterSeconds),
-      ...corsHeaders,
+      ...(cors ? corsHeaders : { 'X-Content-Type-Options': 'nosniff' }),
     },
     body: JSON.stringify({ error: 'Too many requests' }),
   };
 }
 
 /** Returns a 429 / 414 response object if rate-limited or the query string is
- *  oversized, or null if allowed. The response already carries CORS headers.
- *  Retry-After reflects the actual time left in the window (previously the
- *  full window length). */
-export function checkRateLimit(event, max = 60, windowMs = 60_000) {
+ *  oversized, or null if allowed. The response already carries CORS headers
+ *  (unless `opts.cors === false` — the no-CORS-endpoint posture, matching
+ *  createResponders; previously consumers had to scrub the header off the
+ *  kit-shaped 429/414 by hand). Retry-After reflects the actual time left in
+ *  the window (previously the full window length). */
+export function checkRateLimit(event, max = 60, windowMs = 60_000, opts = {}) {
+  const cors = !(opts && opts.cors === false);
   const qs = event.rawQuery || event.rawQueryString || '';
   if (typeof qs === 'string' && qs.length > MAX_QUERY_LENGTH) {
-    return queryTooLongResponse();
+    return queryTooLongResponse(cors);
   }
   const verdict = checkWindow('ip', extractIp(event), max, windowMs, Date.now());
-  return verdict.ok ? null : tooManyRequestsResponse(verdict.retryAfter);
+  return verdict.ok ? null : tooManyRequestsResponse(verdict.retryAfter, cors);
 }
 
 // --- market-monitor: checkRateLimitDistributed (Netlify Blobs) ---
@@ -769,23 +864,25 @@ function getRateStore() {
  *     back to the in-memory limiter (previous behavior); when true it denies.
  *     Write-conflict exhaustion ALWAYS denies regardless of this flag.
  *   - retries    {number}  CAS retry budget (default 5).
+ *   - cors       {boolean} default true. false → the 429/414 shapes carry no
+ *     Access-Control-* headers (matches checkRateLimit / createResponders).
  *   - store      {object}  test seam: inject a Blobs-shaped store. */
 export async function checkRateLimitDistributed(event, max = 60, windowMs = 60_000, opts = {}) {
-  const { failClosed = false, retries = 5, store: injectedStore = null } = opts || {};
+  const { failClosed = false, retries = 5, cors = true, store: injectedStore = null } = opts || {};
   const qs = event.rawQuery || event.rawQueryString || '';
   if (typeof qs === 'string' && qs.length > MAX_QUERY_LENGTH) {
-    return queryTooLongResponse();
+    return queryTooLongResponse(cors);
   }
 
   const store = injectedStore || await getRateStore();
-  if (!store) return checkRateLimit(event, max, windowMs);
+  if (!store) return checkRateLimit(event, max, windowMs, { cors });
 
   const ip = extractIp(event);
   const now = Date.now();
   const windowStart = Math.floor(now / windowMs) * windowMs;
   const key = `rl:${ip}:${windowStart}`;
   const denied = () =>
-    tooManyRequestsResponse(Math.max(1, Math.ceil((windowStart + windowMs - now) / 1000)));
+    tooManyRequestsResponse(Math.max(1, Math.ceil((windowStart + windowMs - now) / 1000)), cors);
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     let data = null;
@@ -797,7 +894,7 @@ export async function checkRateLimitDistributed(event, max = 60, windowMs = 60_0
     } catch {
       // Read/store failure: fall back to the in-memory limiter (default), or
       // deny when the caller asked to fail closed.
-      return failClosed ? denied() : checkRateLimit(event, max, windowMs);
+      return failClosed ? denied() : checkRateLimit(event, max, windowMs, { cors });
     }
 
     const count = (data?.count || 0) + 1;
@@ -814,7 +911,7 @@ export async function checkRateLimitDistributed(event, max = 60, windowMs = 60_0
       // in-memory limiter (still throttles per-instance) by default, or deny when
       // the caller asked to fail closed — never blanket-allow, which would let a
       // write-only Blobs degradation bypass the limit entirely.
-      return failClosed ? denied() : checkRateLimit(event, max, windowMs);
+      return failClosed ? denied() : checkRateLimit(event, max, windowMs, { cors });
     }
 
     // Conditional writes report `{ modified: false }` when the precondition
@@ -950,6 +1047,12 @@ export async function setTTLCached(store, key, data, { now = Date.now() } = {}) 
  *   - `rateLimit`   — `{ max, windowMs }` (default 60 / 60 s); `null`/`false`
  *                     disables the limiter.
  *   - `distributed` — when true, uses the Blobs-backed limiter.
+ *   - `cors`        — default true. `false` → NONE of the responses this
+ *                     wrapper itself emits carry Access-Control-* headers:
+ *                     the OPTIONS short-circuit becomes a bare 204, the
+ *                     limiter's 429/414 and the catch-all 500 use the no-CORS
+ *                     shapes (pair with `createResponders({ cors: false })`
+ *                     inside `handle` for a fully CORS-free endpoint).
  *   - `handle`      — `async (event) => responseObject`. Required.
  *   - `onError`     — `async (error, event) => responseObject`. Optional. */
 export function createHandler(options) {
@@ -957,6 +1060,7 @@ export function createHandler(options) {
     name = 'handler',
     rateLimit: rateLimitOpt = { max: 60, windowMs: 60_000 },
     distributed = false,
+    cors = true,
     handle,
     onError,
   } = options || {};
@@ -968,12 +1072,14 @@ export function createHandler(options) {
   const limiterEnabled = rateLimitOpt !== null && rateLimitOpt !== false;
   const limit = limiterEnabled
     ? (distributed
-        ? (event) => checkRateLimitDistributed(event, rateLimitOpt.max, rateLimitOpt.windowMs)
-        : (event) => checkRateLimit(event, rateLimitOpt.max, rateLimitOpt.windowMs))
+        ? (event) => checkRateLimitDistributed(event, rateLimitOpt.max, rateLimitOpt.windowMs, { cors })
+        : (event) => checkRateLimit(event, rateLimitOpt.max, rateLimitOpt.windowMs, { cors }))
     : null;
 
   return async (event, context) => {
-    const preflight = handlePreflight(event);
+    const preflight = cors
+      ? handlePreflight(event)
+      : (event && event.httpMethod === 'OPTIONS' ? { statusCode: 204, headers: {}, body: '' } : null);
     if (preflight) return preflight;
 
     if (limit) {
@@ -992,7 +1098,7 @@ export function createHandler(options) {
         }
       }
       console.error(`${name} error:`, errorMessage(error));
-      return errorResponse(500, 'Internal error');
+      return _errorResponse(500, 'Internal error', undefined, cors);
     }
   };
 }

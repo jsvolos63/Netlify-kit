@@ -19,6 +19,7 @@ import {
   serverError,
   badGateway,
   upstreamError,
+  createResponders,
   errorMessage,
   checkResponseSize,
   readTextCapped,
@@ -162,6 +163,83 @@ test('response sugar (FlightCheck form)', () => {
   assert.equal(upstreamError(200, 'x').statusCode, 502);
   assert.equal(upstreamError(503, 'x').statusCode, 503);
   assert.equal(upstreamError(429, 'busy', { 'Retry-After': '30' }).headers['Retry-After'], '30');
+});
+
+// No response may carry any Access-Control-* header (the no-CORS-endpoint
+// posture: per-query-billed proxies stay unreadable to cross-origin scripts).
+function assertNoCorsHeaders(r) {
+  for (const k of Object.keys(r.headers || {})) {
+    assert.ok(!k.toLowerCase().startsWith('access-control-'), `unexpected CORS header ${k}`);
+  }
+}
+
+test('createResponders (default): byte-identical to the module-level helpers', () => {
+  const d = createResponders();
+  assert.deepEqual(d.jsonResponse({ a: 1 }, 'no-store', { ETag: 'x' }), jsonResponse({ a: 1 }, 'no-store', { ETag: 'x' }));
+  assert.deepEqual(d.jsonResponse(404, { error: 'nope' }), jsonResponse(404, { error: 'nope' }));
+  assert.deepEqual(d.errorResponse(400, 'x', { 'Retry-After': '5' }), errorResponse(400, 'x', { 'Retry-After': '5' }));
+  assert.deepEqual(d.textResponse(200, 'hi', { cacheControl: 'no-store' }), textResponse(200, 'hi', { cacheControl: 'no-store' }));
+  assert.deepEqual(d.ok({ a: 1 }), ok({ a: 1 }));
+  assert.deepEqual(d.badRequest('x'), badRequest('x'));
+  assert.deepEqual(d.notFound('x'), notFound('x'));
+  assert.deepEqual(d.methodNotAllowed(), methodNotAllowed());
+  assert.deepEqual(d.serverError('x'), serverError('x'));
+  assert.deepEqual(d.badGateway('x'), badGateway('x'));
+  assert.deepEqual(d.upstreamError(200, 'x'), upstreamError(200, 'x'));
+});
+
+test('createResponders({ cors: false }): identical shapes, zero CORS headers', () => {
+  const n = createResponders({ cors: false });
+
+  // body-first JSON: same status/body/content-type/cache-control, nosniff kept.
+  const bf = n.jsonResponse({ a: 1 }, 'no-store', { ETag: 'x' });
+  assertNoCorsHeaders(bf);
+  assert.equal(bf.statusCode, 200);
+  assert.equal(bf.headers['Content-Type'], 'application/json');
+  assert.equal(bf.headers['X-Content-Type-Options'], 'nosniff');
+  assert.equal(bf.headers['Cache-Control'], 'no-store');
+  assert.equal(bf.headers.ETag, 'x');
+  assert.equal(bf.body, '{"a":1}');
+
+  // status-first JSON: no access-control-allow-origin unless explicitly asked.
+  const sf = n.jsonResponse(404, { error: 'nope' });
+  assertNoCorsHeaders(sf);
+  assert.equal(sf.statusCode, 404);
+  assert.equal(sf.headers['content-type'], 'application/json; charset=utf-8');
+  assert.equal(sf.headers['cache-control'], 'no-store');
+  assert.equal(sf.body, '{"error":"nope"}');
+  // ... an explicit per-call corsOrigin always means it, even with cors:false.
+  const explicit = n.jsonResponse(200, { ok: 1 }, { corsOrigin: 'https://app.example' });
+  assert.equal(explicit.headers['access-control-allow-origin'], 'https://app.example');
+
+  // text: same content-type, no CORS; opt-in cache-control still works.
+  const t = n.textResponse(200, 'hello', { cacheControl: 'no-store' });
+  assertNoCorsHeaders(t);
+  assert.equal(t.headers['content-type'], 'text/plain; charset=utf-8');
+  assert.equal(t.headers['cache-control'], 'no-store');
+  assert.equal(t.body, 'hello');
+
+  // errorResponse + the sugar: shape parity with the CORS versions.
+  const e = n.errorResponse(400, 'Missing symbol', { 'Retry-After': '5' });
+  assertNoCorsHeaders(e);
+  assert.equal(e.headers['Retry-After'], '5');
+  assert.deepEqual(JSON.parse(e.body), { error: 'Missing symbol' });
+  for (const [r, status] of [
+    [n.ok({}), 200], [n.badRequest('x'), 400], [n.notFound('x'), 404],
+    [n.methodNotAllowed(), 405], [n.serverError('x'), 500], [n.badGateway('x'), 502],
+  ]) {
+    assertNoCorsHeaders(r);
+    assert.equal(r.statusCode, status);
+  }
+  assert.deepEqual(JSON.parse(n.methodNotAllowed().body), { error: 'Method not allowed.' });
+  // upstreamError still clamps and forwards Retry-After.
+  assert.equal(n.upstreamError(200, 'x').statusCode, 502);
+  const up = n.upstreamError(429, 'busy', { 'Retry-After': '30' });
+  assertNoCorsHeaders(up);
+  assert.equal(up.headers['Retry-After'], '30');
+
+  // The default exports are untouched by the factory existing.
+  assert.equal(ok({}).headers['Access-Control-Allow-Origin'], '*');
 });
 
 test('errorMessage: bounded stringification', () => {
@@ -384,6 +462,77 @@ test('fetchWithRetry: no retry on 400; 429 opt-in; network retried; AbortError n
   assert.ok(RETRYABLE_STATUSES.has(503) && !RETRYABLE_STATUSES.has(500));
 });
 
+test('fetchWithRetry: retries:0 performs exactly one attempt (billed upstreams)', async () => {
+  // A retryable 503 is returned as-is — no second request is ever issued.
+  let n = 0;
+  const r = await fetchWithRetry('u', {}, { fetchFn: async () => { n++; return { status: 503, body: { cancel: async () => {} } }; }, sleepFn: noSleep, retries: 0 });
+  assert.equal(r.status, 503);
+  assert.equal(n, 1);
+  // A thrown network error propagates after the single attempt.
+  n = 0;
+  await assert.rejects(
+    () => fetchWithRetry('u', {}, { fetchFn: async () => { n++; throw new Error('ECONNRESET'); }, sleepFn: noSleep, retries: 0 }),
+    /ECONNRESET/,
+  );
+  assert.equal(n, 1);
+});
+
+// A fetchFn that hangs until its per-attempt signal aborts (like real fetch).
+const hangingFetch = (calls) => (url, init) => new Promise((resolve, reject) => {
+  calls.push(init);
+  const abort = () => {
+    const e = new Error('This operation was aborted');
+    e.name = 'AbortError';
+    reject(e);
+  };
+  if (init.signal.aborted) abort();
+  else init.signal.addEventListener('abort', abort, { once: true });
+});
+
+test('fetchWithRetry: attemptTimeoutMs bounds a single attempt (retries:0)', async () => {
+  const calls = [];
+  const start = Date.now();
+  await assert.rejects(
+    () => fetchWithRetry('u', {}, { fetchFn: hangingFetch(calls), sleepFn: noSleep, retries: 0, attemptTimeoutMs: 30 }),
+    (e) => e.name === 'TimeoutError' && e.timedOut === true && /timed out after 30ms/.test(e.message),
+  );
+  assert.equal(calls.length, 1);
+  assert.ok(Date.now() - start < 2000, 'rejected promptly rather than hanging');
+});
+
+test('fetchWithRetry: each attempt gets its OWN deadline; a timed-out attempt is retryable', async () => {
+  let n = 0;
+  const fetchFn = (url, init) => {
+    n++;
+    if (n === 1) return hangingFetch([])(url, init); // first attempt hangs → per-attempt timeout
+    return Promise.resolve({ status: 200 });
+  };
+  const r = await fetchWithRetry('u', {}, { fetchFn, sleepFn: noSleep, retries: 1, attemptTimeoutMs: 30 });
+  assert.equal(r.status, 200);
+  assert.equal(n, 2);
+});
+
+test('fetchWithRetry: a caller-signal abort stays terminal even with attemptTimeoutMs', async () => {
+  const ctl = new AbortController();
+  const calls = [];
+  const p = assert.rejects(
+    () => fetchWithRetry('u', { signal: ctl.signal }, { fetchFn: hangingFetch(calls), sleepFn: noSleep, retries: 3, attemptTimeoutMs: 5000 }),
+    (e) => e.name === 'AbortError',
+  );
+  ctl.abort();
+  await p;
+  assert.equal(calls.length, 1); // no retry after the caller aborted
+});
+
+test('fetchWithRetry: without attemptTimeoutMs, init passes through untouched', async () => {
+  // Existing callers (e.g. init.signal = AbortSignal.timeout(...)) keep the
+  // exact same object — no wrapper controller is interposed.
+  const init = { headers: { a: '1' } };
+  let seen;
+  await fetchWithRetry('u', init, { fetchFn: async (url, i) => { seen = i; return { status: 200 }; }, sleepFn: noSleep });
+  assert.strictEqual(seen, init);
+});
+
 // ──────────────────────── rate limiting ─────────────────────────
 
 test('clientIp: precedence', () => {
@@ -554,6 +703,33 @@ test('rateLimit validates the IP (no junk-header bucket minting / poisoning)', (
   assert.equal(rateLimit(junkB, { name: 'feed', windowMs: 60_000, max: 1 }, 2).ok, false);
 });
 
+test('checkRateLimit / checkRateLimitDistributed: { cors: false } strips CORS off 429 and 414', async () => {
+  _resetRateLimit();
+  const ev = eventWith({ headers: { 'x-forwarded-for': '5.5.5.5' } });
+  assert.equal(checkRateLimit(ev, 1, 60_000, { cors: false }), null);
+  const blocked = checkRateLimit(ev, 1, 60_000, { cors: false });
+  assert.equal(blocked.statusCode, 429);
+  assertNoCorsHeaders(blocked);
+  assert.ok(blocked.headers['Retry-After']); // the useful headers survive
+  assert.equal(blocked.headers['X-Content-Type-Options'], 'nosniff');
+
+  const long = checkRateLimit(eventWith({ headers: {}, rawQuery: 'x'.repeat(MAX_QUERY_LENGTH + 1) }), 60, 60_000, { cors: false });
+  assert.equal(long.statusCode, 414);
+  assertNoCorsHeaders(long);
+
+  // Distributed: the CAS deny and the in-memory fallback both honor cors:false.
+  const store = casStore();
+  const dev = eventWith({ headers: { 'x-forwarded-for': '5.5.6.6' } });
+  assert.equal(await checkRateLimitDistributed(dev, 1, 60_000, { store, cors: false }), null);
+  const dblocked = await checkRateLimitDistributed(dev, 1, 60_000, { store, cors: false });
+  assert.equal(dblocked.statusCode, 429);
+  assertNoCorsHeaders(dblocked);
+  _resetStoreCache();
+  const fev = eventWith({ headers: { 'x-forwarded-for': '5.5.7.7' } });
+  assert.equal(await checkRateLimitDistributed(fev, 1, 60_000, { cors: false }), null); // no blobs → fallback
+  assertNoCorsHeaders(await checkRateLimitDistributed(fev, 1, 60_000, { cors: false }));
+});
+
 // ─────────────────────── handler factory ────────────────────────
 
 test('createHandler: preflight, happy path, rate limit, error → 500, onError', async () => {
@@ -577,6 +753,41 @@ test('createHandler: preflight, happy path, rate limit, error → 500, onError',
   assert.equal((await custom(eventWith({}))).statusCode, 503);
 
   assert.throws(() => createHandler({}), /handle option is required/);
+});
+
+test('createHandler({ cors: false }): preflight, 429, and 500 all emit zero CORS headers', async () => {
+  _resetRateLimit();
+  const responders = createResponders({ cors: false });
+
+  // OPTIONS short-circuit becomes a bare 204.
+  const bare = createHandler({ cors: false, handle: async () => responders.ok({}) });
+  const pf = await bare(eventWith({ method: 'OPTIONS' }));
+  assert.equal(pf.statusCode, 204);
+  assert.deepEqual(pf.headers, {});
+
+  // The limiter's 429 honors the opt-out.
+  const limited = createHandler({ cors: false, rateLimit: { max: 1, windowMs: 60_000 }, handle: async () => responders.ok({}) });
+  const ev = eventWith({ headers: { 'x-forwarded-for': '4.5.6.7' } });
+  const first = await limited(ev);
+  assert.equal(first.statusCode, 200);
+  assertNoCorsHeaders(first); // handle used the no-CORS responders
+  const blocked = await limited(ev);
+  assert.equal(blocked.statusCode, 429);
+  assertNoCorsHeaders(blocked);
+
+  // The catch-all 500 honors it too.
+  const thrower = createHandler({ cors: false, rateLimit: null, handle: async () => { throw new Error('boom'); } });
+  const r = await thrower(eventWith({}));
+  assert.equal(r.statusCode, 500);
+  assertNoCorsHeaders(r);
+  assert.deepEqual(JSON.parse(r.body), { error: 'Internal error' });
+
+  // Default createHandler still speaks CORS everywhere (unchanged behavior).
+  _resetRateLimit();
+  const dflt = createHandler({ rateLimit: { max: 1, windowMs: 60_000 }, handle: async () => ok({}) });
+  const dev = eventWith({ headers: { 'x-forwarded-for': '4.5.6.8' } });
+  await dflt(dev);
+  assert.equal((await dflt(dev)).headers['Access-Control-Allow-Origin'], '*');
 });
 
 // ─────────────── Netlify Blobs: store opener + short-TTL cache ───────────────
