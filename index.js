@@ -513,10 +513,16 @@ async function _requestPinned(target, vetted, { method, headers, deadline }) {
       lookup: (_h, _o, cb) => cb(null, vetted.address, vetted.family),
     };
     if (isHttps) opts.servername = target.hostname; // correct SNI to the pinned IP
-    const req = mod.request(opts, resolve);
+    // A HARD deadline timer, not req.setTimeout(): the socket timeout is
+    // inactivity-based, so a server trickling header bytes (one filler header
+    // line per interval) resets it forever and the headers phase could stall
+    // arbitrarily past the caller's total budget. Once headers arrive the
+    // body read is bounded by its own deadline race in safeFetch.
+    let timer;
+    const req = mod.request(opts, (res) => { clearTimeout(timer); resolve(res); });
     const budget = Math.max(1, deadline - Date.now());
-    req.setTimeout(budget, () => req.destroy(new Error('safeFetch: request timed out')));
-    req.on('error', reject);
+    timer = setTimeout(() => req.destroy(new Error('safeFetch: request timed out')), budget);
+    req.on('error', (e) => { clearTimeout(timer); reject(e); });
     req.end();
   });
 }
@@ -736,7 +742,14 @@ export async function fetchWithRetry(url, init, opts) {
 // Both are best-effort, in-process (per warm instance); the distributed variant
 // adds a Netlify Blobs bucket with transparent in-memory fallback.
 
-const IP_RE = /^(?:\d{1,3}\.){3}\d{1,3}$|^[0-9a-fA-F:]{2,39}$/;
+// Dotted-quad IPv4 (octet ranges are re-checked in extractIp) or an IPv6
+// literal — which always contains at least one ':'. The colon requirement
+// matters: without it any 2-39 char hex-only word ("abc", "deadbeef", …) in a
+// junk x-forwarded-for passed as an "IP" and minted its own bucket key,
+// re-opening exactly the cardinality-flood amplification this check exists to
+// prevent. (Mixed-notation IPv6 like ::ffff:1.2.3.4 contains dots, fails both
+// alternatives, and collapses into 'unknown' — unchanged, fail-toward-throttle.)
+const IP_RE = /^(?:\d{1,3}\.){3}\d{1,3}$|^(?=[0-9a-fA-F:]{2,39}$)[0-9a-fA-F]*:[0-9a-fA-F:]*$/;
 export const MAX_QUERY_LENGTH = 2048;
 
 // --- shared engine: per-`${name}:${ip}` fixed-window buckets ---
@@ -749,7 +762,12 @@ const MAX_KEYS = 5000;
  *  toward throttling rather than toward a bypass). */
 function extractIp(event) {
   const ip = clientIp(event);
-  return IP_RE.test(ip) ? ip : 'unknown';
+  if (!IP_RE.test(ip)) return 'unknown';
+  // A dotted-quad must also have in-range octets: "999.1.1.1" is not an IP,
+  // and each out-of-range variant would otherwise mint its own bucket key
+  // (~10^12 possible junk keys from a caller-controlled x-forwarded-for).
+  if (ip.includes('.') && ipv4ToInt(ip) === null) return 'unknown';
+  return ip;
 }
 
 function pruneBuckets(now, windowMs) {
