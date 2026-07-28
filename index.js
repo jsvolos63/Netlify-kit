@@ -494,6 +494,25 @@ function _nodeCapAdapter(res) {
   };
 }
 
+// Request headers that carry a credential, dropped when a redirect crosses to
+// a different origin. Browsers and undici strip authorization on a cross-origin
+// hop; safeFetch follows redirects itself, so it has to do the same. Without
+// this, an Authorization header meant for host A is replayed verbatim to
+// whatever host A's Location names — and since that host is an ordinary public
+// one, every SSRF guard here passes it. That turns any fetch of a
+// caller-supplied URL into a credential-exfiltration primitive.
+const CREDENTIAL_HEADER = /^(?:authorization|proxy-authorization|cookie|cookie2)$/i;
+const CREDENTIAL_SUFFIX = /(?:^|-)(?:keys?|tokens?|secrets?|password|credentials?)$/i;
+
+function _stripCredentialHeaders(headers) {
+  const out = {};
+  for (const [name, value] of Object.entries(headers || {})) {
+    if (CREDENTIAL_HEADER.test(name) || CREDENTIAL_SUFFIX.test(name)) continue;
+    out[name] = value;
+  }
+  return out;
+}
+
 // Issue one request over node:http/https, connecting to the pre-vetted IP via a
 // pinned `lookup` while keeping the real hostname for the Host header and TLS
 // SNI (servername). Resolves with the IncomingMessage once headers arrive.
@@ -571,6 +590,7 @@ export async function safeFetch(url, init = {}) {
   } = init || {};
   const deadline = Date.now() + Math.max(1, timeoutMs);
   let currentUrl = String(url);
+  let currentHeaders = headers;
   let hops = 0;
 
   for (;;) {
@@ -601,7 +621,7 @@ export async function safeFetch(url, init = {}) {
     }
     if (Date.now() >= deadline) throw new Error('safeFetch: timeout');
 
-    const res = await _requestPinned(target, vetted, { method, headers, deadline });
+    const res = await _requestPinned(target, vetted, { method, headers: currentHeaders, deadline });
     const status = res.statusCode || 0;
     const location = res.headers.location;
 
@@ -609,7 +629,10 @@ export async function safeFetch(url, init = {}) {
       res.resume(); // drain the redirect body to free the socket
       if (hops >= maxRedirects) { res.destroy(); throw new Error('safeFetch: too-many-redirects'); }
       hops += 1;
-      currentUrl = new URL(location, currentUrl).toString(); // re-vetted next iteration
+      const next = new URL(location, currentUrl);
+      // Leaving this origin? The caller's credentials were scoped to it.
+      if (next.origin !== target.origin) currentHeaders = _stripCredentialHeaders(currentHeaders);
+      currentUrl = next.toString(); // re-vetted next iteration
       continue;
     }
 
@@ -749,7 +772,42 @@ export async function fetchWithRetry(url, init, opts) {
 // re-opening exactly the cardinality-flood amplification this check exists to
 // prevent. (Mixed-notation IPv6 like ::ffff:1.2.3.4 contains dots, fails both
 // alternatives, and collapses into 'unknown' — unchanged, fail-toward-throttle.)
-const IP_RE = /^(?:\d{1,3}\.){3}\d{1,3}$|^(?=[0-9a-fA-F:]{2,39}$)[0-9a-fA-F]*:[0-9a-fA-F:]*$/;
+const IPV4_RE = /^(?:\d{1,3}\.){3}\d{1,3}$/;
+const IPV6_GROUP_RE = /^[0-9a-fA-F]{1,4}$/;
+
+/* Strict IPv6: at most one "::" elision, 1-4 hex digits per group, exactly
+   eight groups without an elision and fewer with one, plus the optional
+   trailing dotted-quad form. Hand-rolled because extractIp is synchronous
+   (it cannot `await import('node:net')`), and the previous character-class
+   match accepted non-addresses like "a:b", "0:" and "dead:beef:" — each junk
+   spelling minting its own bucket key, which is exactly the cardinality flood
+   the validation exists to stop. */
+function isIpv6(s) {
+  if (typeof s !== 'string' || s.length < 2 || s.length > 45) return false;
+  if (s.includes(':::')) return false;
+  const elision = s.indexOf('::');
+  if (elision !== s.lastIndexOf('::')) return false; // at most one
+
+  let body = s;
+  let groups = 0;
+  // A trailing dotted-quad ("::ffff:192.0.2.1") stands in for two groups.
+  const lastColon = body.lastIndexOf(':');
+  if (lastColon !== -1 && body.slice(lastColon + 1).includes('.')) {
+    if (ipv4ToInt(body.slice(lastColon + 1)) === null) return false;
+    body = body.slice(0, lastColon);
+    groups += 2;
+  }
+
+  const parts = body.split(':');
+  for (const p of parts) {
+    if (p === '') continue; // an elision boundary, checked below
+    if (!IPV6_GROUP_RE.test(p)) return false;
+    groups += 1;
+  }
+  // No elision: every group must be present and spelled out.
+  if (elision === -1) return parts.every((p) => p !== '') && groups === 8;
+  return groups <= 7; // "::" stands for at least one all-zero group
+}
 export const MAX_QUERY_LENGTH = 2048;
 
 // --- shared engine: per-`${name}:${ip}` fixed-window buckets ---
@@ -757,17 +815,17 @@ export const MAX_QUERY_LENGTH = 2048;
 const buckets = new Map();
 const MAX_KEYS = 5000;
 
-/** Validated client IP for bucketing: clientIp() → IP_RE check → 'unknown'.
+/** Validated client IP for bucketing: clientIp() → IPv4/IPv6 parse → 'unknown'.
  *  Anything unparseable collapses into the shared 'unknown' bucket (fail
  *  toward throttling rather than toward a bypass). */
 function extractIp(event) {
   const ip = clientIp(event);
-  if (!IP_RE.test(ip)) return 'unknown';
   // A dotted-quad must also have in-range octets: "999.1.1.1" is not an IP,
   // and each out-of-range variant would otherwise mint its own bucket key
   // (~10^12 possible junk keys from a caller-controlled x-forwarded-for).
-  if (ip.includes('.') && ipv4ToInt(ip) === null) return 'unknown';
-  return ip;
+  if (IPV4_RE.test(ip)) return ipv4ToInt(ip) === null ? 'unknown' : ip;
+  if (isIpv6(ip)) return ip;
+  return 'unknown';
 }
 
 function pruneBuckets(now, windowMs) {
@@ -952,19 +1010,32 @@ export function _resetStoreCache() { storePromise = null; }
 // --- Surf-Tracker form: rateLimit (per-name buckets, returns { ok, retryAfter }) ---
 
 /** Best client IP from a Netlify event: `x-nf-client-connection-ip` (the real
- *  client IP Netlify sets) → first `x-forwarded-for` hop → `client-ip` →
- *  `'unknown'`. */
+ *  client IP Netlify sets) → LAST `x-forwarded-for` hop → `'unknown'`.
+ *
+ *  The last hop, not the first: proxies APPEND, so the leftmost entry is the
+ *  one the caller wrote and the rightmost is the one the nearest trusted proxy
+ *  added. Keying a rate limiter on the leftmost hop lets a caller mint a fresh
+ *  bucket per request by rotating the header — with `max: 1`, 3000 requests
+ *  carrying rotating well-formed XFF values were all allowed. The old
+ *  `client-ip` fallback is dropped entirely: it has no platform meaning and is
+ *  purely caller-supplied.
+ *
+ *  Callers adapting a web `Request` must not copy a client-supplied
+ *  `x-nf-client-connection-ip` into the event; strip it before re-adding the
+ *  runtime's own resolved IP. */
 export function clientIp(event) {
   const h = (event && event.headers) || {};
-  const xff = typeof h['x-forwarded-for'] === 'string' ? h['x-forwarded-for'].split(',')[0].trim() : '';
-  return h['x-nf-client-connection-ip'] || xff || h['client-ip'] || 'unknown';
+  const raw = typeof h['x-forwarded-for'] === 'string' ? h['x-forwarded-for'] : '';
+  const hops = raw.split(',');
+  const xff = hops[hops.length - 1].trim();
+  return h['x-nf-client-connection-ip'] || xff || 'unknown';
 }
 
 /** Fixed-window check. Returns `{ ok: true }` under the limit, or
  *  `{ ok: false, retryAfter }` (seconds) once `max` is exceeded within
  *  `windowMs`. Fails open by construction. Shares the bucket store with
  *  checkRateLimit (namespaced by `name`, so counts never collide).
- *  Keys on the IP_RE-validated IP (via extractIp), same as checkRateLimit —
+ *  Keys on the parse-validated IP (via extractIp), same as checkRateLimit —
  *  so a caller-controlled junk `x-forwarded-for` can't mint unbounded bucket
  *  keys (cardinality-flood amplification) and unparseable IPs collapse into
  *  one shared 'unknown' bucket rather than each getting their own. */
