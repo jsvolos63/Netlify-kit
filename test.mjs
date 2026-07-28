@@ -565,8 +565,11 @@ test('fetchWithRetry: without attemptTimeoutMs, init passes through untouched', 
 
 test('clientIp: precedence', () => {
   assert.equal(clientIp(eventWith({ headers: { 'x-nf-client-connection-ip': '1.2.3.4' } })), '1.2.3.4');
-  assert.equal(clientIp(eventWith({ headers: { 'x-forwarded-for': '5.6.7.8, 9.9.9.9' } })), '5.6.7.8');
-  assert.equal(clientIp(eventWith({ headers: { 'client-ip': '10.0.0.9' } })), '10.0.0.9');
+  // The LAST hop, not the first: proxies append, so '5.6.7.8' here is whatever
+  // the caller wrote and '9.9.9.9' is what the nearest trusted proxy observed.
+  assert.equal(clientIp(eventWith({ headers: { 'x-forwarded-for': '5.6.7.8, 9.9.9.9' } })), '9.9.9.9');
+  // 'client-ip' has no platform meaning and is fully caller-supplied.
+  assert.equal(clientIp(eventWith({ headers: { 'client-ip': '10.0.0.9' } })), 'unknown');
   assert.equal(clientIp(eventWith({})), 'unknown');
 });
 
@@ -1138,4 +1141,128 @@ test('userFacingReason: honest 429 message, fallback detail otherwise', () => {
   const other = Object.assign(new Error('x'), { status: 500 });
   assert.equal(userFacingReason(other, 'fallback text'), 'fallback text');
   assert.equal(userFacingReason(null, 'fallback text'), 'fallback text');
+});
+
+// --- cross-origin redirect credential stripping ---------------------------
+
+// Two local origins (same host, different ports) so a redirect can cross an
+// origin boundary. Both are permitted by _validate; in production the same code
+// path runs against two public HTTPS hosts.
+async function withTwoServers(handlerA, handlerB, run) {
+  const origins = {};
+  const a = http.createServer((req, res) => handlerA(req, res, origins));
+  const b = http.createServer((req, res) => handlerB(req, res, origins));
+  await new Promise((r) => a.listen(0, '127.0.0.1', r));
+  await new Promise((r) => b.listen(0, '127.0.0.1', r));
+  origins.a = `http://127.0.0.1:${a.address().port}`;
+  origins.b = `http://127.0.0.1:${b.address().port}`;
+  const _validate = (u) => {
+    const url = new URL(u);
+    return url.origin === origins.a || url.origin === origins.b
+      ? { ok: true, url, error: null }
+      : parseSafeHttpsUrl(u);
+  };
+  const _resolve = async (host) => (host === '127.0.0.1'
+    ? { ok: true, address: '127.0.0.1', family: 4 }
+    : { ok: false, error: 'dns-failed' });
+  try {
+    return await run({ originA: origins.a, originB: origins.b, _validate, _resolve });
+  } finally {
+    a.close();
+    b.close();
+  }
+}
+
+test('safeFetch: credential headers are dropped on a cross-origin redirect', async () => {
+  let sawOnB = null;
+  await withTwoServers(
+    (req, res, o) => { res.writeHead(302, { location: `${o.b}/steal` }); res.end(); },
+    (req, res) => {
+      sawOnB = req.headers;
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('landed');
+    },
+    async ({ originA, _validate, _resolve }) => {
+      const r = await safeFetch(`${originA}/start`, {
+        headers: {
+          authorization: 'Bearer VICTIM-API-KEY',
+          cookie: 'session=abc',
+          'x-api-key': 'k',
+          'x-auth-token': 't',
+          'x-request-id': 'keep-me',
+        },
+        _validate,
+        _resolve,
+      });
+      assert.equal(await r.text(), 'landed');
+      // The redirect target is an ordinary public host, so every SSRF guard
+      // passes it — only the credential strip stops the exfiltration.
+      assert.equal(sawOnB.authorization, undefined);
+      assert.equal(sawOnB.cookie, undefined);
+      assert.equal(sawOnB['x-api-key'], undefined);
+      assert.equal(sawOnB['x-auth-token'], undefined);
+      assert.equal(sawOnB['x-request-id'], 'keep-me', 'non-credential headers still travel');
+    },
+  );
+});
+
+test('safeFetch: credential headers survive a same-origin redirect', async () => {
+  let sawFinal = null;
+  await withServer(
+    (req, res) => {
+      if (req.url === '/start') { res.writeHead(302, { location: '/final' }); res.end(); return; }
+      sawFinal = req.headers;
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('ok');
+    },
+    async ({ origin, _validate, _resolve }) => {
+      await safeFetch(`${origin}/start`, {
+        headers: { authorization: 'Bearer KEEP' },
+        _validate,
+        _resolve,
+      });
+      assert.equal(sawFinal.authorization, 'Bearer KEEP');
+    },
+  );
+});
+
+// --- limiter IP resolution ------------------------------------------------
+
+test('clientIp: takes the last x-forwarded-for hop, not the caller-written first', () => {
+  assert.equal(clientIp({ headers: { 'x-forwarded-for': '1.2.3.4, 203.0.113.7' } }), '203.0.113.7');
+  assert.equal(clientIp({ headers: { 'x-forwarded-for': '203.0.113.7' } }), '203.0.113.7');
+  assert.equal(
+    clientIp({ headers: { 'x-nf-client-connection-ip': '198.51.100.9', 'x-forwarded-for': '1.2.3.4' } }),
+    '198.51.100.9',
+    'the platform header still wins',
+  );
+  assert.equal(clientIp({ headers: { 'client-ip': '1.2.3.4' } }), 'unknown', 'client-ip is no longer trusted');
+  assert.equal(clientIp({ headers: {} }), 'unknown');
+});
+
+test('rateLimit: rotating the caller-written x-forwarded-for hop cannot mint buckets', () => {
+  const opts = { name: 'xff-spoof', windowMs: 60_000, max: 1 };
+  const ev = (spoof) => ({ headers: { 'x-forwarded-for': `${spoof}, 203.0.113.7` } });
+  assert.equal(rateLimit(ev('10.0.0.1'), opts).ok, true);
+  for (let i = 2; i < 40; i++) {
+    assert.equal(rateLimit(ev(`10.0.0.${i}`), opts).ok, false, 'rotation must not open a fresh bucket');
+  }
+});
+
+test('rateLimit: malformed IPv6 spellings collapse into the shared unknown bucket', () => {
+  const opts = { name: 'v6-junk', windowMs: 60_000, max: 1 };
+  const ev = (ip) => ({ headers: { 'x-nf-client-connection-ip': ip } });
+  assert.equal(rateLimit(ev('0:'), opts).ok, true);
+  for (const junk of ['a:b', 'dead:beef:', '1:2:3:4:5:6:7:8:9', ':1:2', 'zzzz::1', '1::2::3']) {
+    assert.equal(rateLimit(ev(junk), opts).ok, false, junk);
+  }
+});
+
+test('rateLimit: well-formed IPv6 addresses still get their own buckets', () => {
+  const opts = { name: 'v6-ok', windowMs: 60_000, max: 1 };
+  const ev = (ip) => ({ headers: { 'x-nf-client-connection-ip': ip } });
+  for (const ip of ['::1', '::', '2001:db8::1', '::ffff:192.0.2.1', '1:2:3:4:5:6:7:8', 'fe80::a:b:c:d']) {
+    assert.equal(rateLimit(ev(ip), opts).ok, true, ip);
+  }
+  assert.equal(rateLimit(ev('2001:db8::1'), opts).ok, false, 'a repeat hit on the same address is limited');
 });
