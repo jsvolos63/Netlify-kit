@@ -24,8 +24,14 @@ The sibling apps grew slightly different signatures for the same idea
 Surf-Tracker's `jsonResponse(statusCode, obj, opts)` takes an explicit status).
 So apps can adopt the kit by **only changing import paths** — not call sites —
 `jsonResponse` / `textResponse` detect the convention from their first argument
-(a **number** ⇒ status-first form, anything else ⇒ body-first form), and each
-form behaves byte-for-byte like the app it came from. The consolidated sources:
+(a **number** ⇒ status-first form, anything else ⇒ body-first form). Since
+0.8.0 the two JSON forms share one header **shape** (capitalized names,
+`charset=utf-8` on the content-type) while keeping each form's original cache
+semantics (body-first: no `Cache-Control` unless asked; status-first:
+`no-store` by default); new code should prefer the unambiguous named forms
+`jsonBodyResponse` / `jsonStatusResponse` — a bare numeric payload passed to
+the `jsonResponse` overload dispatches as a **status code**, not a body. The
+consolidated sources:
 
 - `market-monitor/netlify/functions/utils/*` (CORS, handler factory, validation,
   retry, SSRF, in-memory + Blobs rate limiters)
@@ -59,9 +65,14 @@ export const handler = createHandler({
 else `null`), `preflightResponse(opts)` (unconditional 204 advertising verbs).
 
 **Responses**
-- `JSON_HEADERS` — `Content-Type: application/json` + CORS.
-- `jsonResponse(body, cacheControl?, extraHeaders?)` **or**
-  `jsonResponse(statusCode, obj, opts?)` — see *Compatibility superset*.
+- `JSON_HEADERS` — `Content-Type: application/json; charset=utf-8` + CORS.
+- `jsonBodyResponse(body, cacheControl?, extraHeaders?)` — 200, no
+  `Cache-Control` unless asked (CDN TTLs are opt-in per call).
+- `jsonStatusResponse(statusCode, obj, opts?)` — explicit status,
+  `Cache-Control: no-store` by default (`opts.cacheControl` overrides).
+- `jsonResponse(...)` — delegating overload over the two named forms above,
+  dispatching on `typeof firstArg === 'number'` — see *Compatibility
+  superset* (and its numeric-payload hazard there).
 - `errorResponse(statusCode, error, extraHeaders?)` — `{ error }` body.
 - `textResponse(statusCode, body, opts?)`.
 - `ok`, `badRequest`, `notFound`, `methodNotAllowed`, `serverError`,
@@ -103,8 +114,10 @@ like `2130706433` / `0x7f000001` / `0177.0.0.1` — no `localhost`/`.internal`/
   blocked URL/host, a redirect past the cap, a timeout, or a transport error.
 
 **Retry** — `fetchWithRetry(url, init, opts)` (exp backoff + full jitter;
-retries network errors + 502/503/504, 429 only with `retryOn429`; injectable
-`fetchFn`/`sleepFn`/`rng`), `RETRYABLE_STATUSES`.
+retries network errors + 502/503/504, 429 only with `retryOn429`; a
+`Retry-After` header on a retryable response sets the delay — capped at
+`opts.capMs`, never negative, jittered backoff when absent/unparseable;
+injectable `fetchFn`/`sleepFn`/`rng`), `RETRYABLE_STATUSES`.
 - `opts.retries: 0` performs **exactly one attempt** (no backoff machinery),
   and `opts.attemptTimeoutMs` gives **each attempt its own AbortSignal
   deadline** — distinct from an overall budget passed as `init.signal` (e.g.
