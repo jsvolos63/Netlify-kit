@@ -17,9 +17,14 @@
 // opts)` takes an explicit status). To let every app adopt the kit by changing
 // only its import paths — not its call sites — `jsonResponse`/`textResponse`
 // detect the calling convention from their first argument (a number ⇒ the
-// status-first form, anything else ⇒ the body-first form). The behavior of each
-// form is byte-for-byte what its origin app already shipped, so the apps' test
-// suites pass unchanged.
+// status-first form, anything else ⇒ the body-first form). Since 0.8.0 the two
+// forms share ONE header shape (capitalized names, charset on the
+// content-type) — wire-identical for HTTP purposes (header names are
+// case-insensitive) but visible to consumer tests that assert exact object
+// keys/values; the CACHE semantics stay exactly as each origin app shipped
+// them (body-first: no Cache-Control unless asked; status-first: no-store by
+// default). New code should prefer the unambiguous named forms
+// `jsonBodyResponse` / `jsonStatusResponse`.
 //
 // Pure ESM, dependency-free at install time. The one optional integration —
 // Netlify Blobs for distributed rate limiting — is reached through a dynamic
@@ -79,7 +84,10 @@ export function preflightResponse(opts) {
 
 // ─────────────────────────── responses ──────────────────────────
 
-export const JSON_HEADERS = { 'Content-Type': 'application/json', ...corsHeaders };
+const JSON_CT_CHARSET = 'application/json; charset=utf-8';
+const TEXT_CT_CHARSET = 'text/plain; charset=utf-8';
+
+export const JSON_HEADERS = { 'Content-Type': JSON_CT_CHARSET, ...corsHeaders };
 
 // CORS opt-out (createResponders / createHandler's `cors: false`): some
 // endpoints must emit NO Access-Control-* headers at all — FlightCheck's
@@ -88,18 +96,39 @@ export const JSON_HEADERS = { 'Content-Type': 'application/json', ...corsHeaders
 // response helper (plus a stripCors() scrubber for kit-shaped 429s) to get
 // that posture. `X-Content-Type-Options: nosniff` is a content-sniffing
 // guard, not a CORS header, so it stays on either way.
-const NO_CORS_JSON_HEADERS = { 'Content-Type': 'application/json', 'X-Content-Type-Options': 'nosniff' };
+const NO_CORS_JSON_HEADERS = { 'Content-Type': JSON_CT_CHARSET, 'X-Content-Type-Options': 'nosniff' };
 const jsonHeadersFor = (cors) => (cors ? JSON_HEADERS : NO_CORS_JSON_HEADERS);
 
-const JSON_CT_CHARSET = 'application/json; charset=utf-8';
-const TEXT_CT_CHARSET = 'text/plain; charset=utf-8';
+// Merge caller-supplied headers into a defaults object CASE-INSENSITIVELY:
+// HTTP header names are case-insensitive on the wire, but these are plain JS
+// objects, so without this a caller's lowercase 'cache-control' override would
+// sit ALONGSIDE the kit's 'Cache-Control' default (duplicate header,
+// platform-dependent wire result) instead of replacing it. The caller's key
+// casing wins for the merged entry.
+function mergeHeadersInto(base, extra) {
+  for (const k of Object.keys(extra)) {
+    for (const bk of Object.keys(base)) {
+      if (bk !== k && bk.toLowerCase() === k.toLowerCase()) delete base[bk];
+    }
+    base[k] = extra[k];
+  }
+  return base;
+}
 
-// market-monitor form: `jsonResponse(body, cacheControl?, extraHeaders?)` → 200.
-// `body` may be a JS value (stringified) or a pre-serialised JSON string.
+/** market-monitor form: `jsonBodyResponse(body, cacheControl?, extraHeaders?)`
+ *  → a 200 with the family CORS + content-type headers. `body` may be a JS
+ *  value (stringified) or a pre-serialised JSON string. Emits NO Cache-Control
+ *  unless `cacheControl` is passed — CDN TTLs are opt-in per call site.
+ *  Prefer this named form over the `jsonResponse` overload: it can never
+ *  mistake a numeric payload for a status code. */
+export function jsonBodyResponse(body, cacheControl, extraHeaders) {
+  return bodyFirstJson(body, cacheControl, extraHeaders);
+}
+
 function bodyFirstJson(body, cacheControl, extraHeaders, cors = true) {
   const headers = { ...jsonHeadersFor(cors) };
   if (cacheControl) headers['Cache-Control'] = cacheControl;
-  if (extraHeaders) Object.assign(headers, extraHeaders);
+  if (extraHeaders) mergeHeadersInto(headers, extraHeaders);
   return {
     statusCode: 200,
     headers,
@@ -107,21 +136,29 @@ function bodyFirstJson(body, cacheControl, extraHeaders, cors = true) {
   };
 }
 
-// Surf-Tracker form: `jsonResponse(statusCode, obj, opts?)`.
+/** Surf-Tracker form: `jsonStatusResponse(statusCode, obj, opts?)` → an
+ *  arbitrary-status JSON body with `Cache-Control: no-store` by default
+ *  (override via `opts.cacheControl`; extra headers via `opts.headers`).
+ *  Prefer this named form over the `jsonResponse` overload when the status
+ *  is explicit. */
+export function jsonStatusResponse(statusCode, obj, opts) {
+  return statusFirstJson(statusCode, obj, opts);
+}
+
 function statusFirstJson(statusCode, obj, opts, cors = true) {
   const o = opts && typeof opts === 'object' ? opts : {};
   const headers = o.headers && typeof o.headers === 'object' ? o.headers : {};
   const cacheControl = typeof o.cacheControl === 'string' ? o.cacheControl : 'no-store';
   const out = {
-    'content-type': JSON_CT_CHARSET,
-    'cache-control': cacheControl,
+    'Content-Type': JSON_CT_CHARSET,
+    'Cache-Control': cacheControl,
   };
   // With CORS off, the header is only emitted when a caller explicitly asks
   // for an origin — an explicit per-call opts.corsOrigin always means it.
   if (cors || typeof o.corsOrigin === 'string') {
-    out['access-control-allow-origin'] = typeof o.corsOrigin === 'string' ? o.corsOrigin : '*';
+    out['Access-Control-Allow-Origin'] = typeof o.corsOrigin === 'string' ? o.corsOrigin : '*';
   }
-  Object.assign(out, headers);
+  mergeHeadersInto(out, headers);
   return {
     statusCode,
     headers: out,
@@ -129,11 +166,17 @@ function statusFirstJson(statusCode, obj, opts, cors = true) {
   };
 }
 
-/** JSON response. Two calling conventions, disambiguated by the first argument:
- *   - `jsonResponse(body, cacheControl?, extraHeaders?)` → a 200 with the
- *     family CORS + content-type headers (market-monitor form).
- *   - `jsonResponse(statusCode, obj, opts?)` → an arbitrary-status JSON body
- *     with `cache-control: no-store` by default (Surf-Tracker form). */
+/** JSON response — a DELEGATING OVERLOAD kept for the original adopters' call
+ *  sites. Dispatch rule: `typeof firstArg === 'number'` picks the status-first
+ *  form, anything else the body-first form:
+ *   - `jsonResponse(body, cacheControl?, extraHeaders?)` → `jsonBodyResponse`
+ *     (market-monitor form: 200, no Cache-Control unless asked).
+ *   - `jsonResponse(statusCode, obj, opts?)` → `jsonStatusResponse`
+ *     (Surf-Tracker form: `Cache-Control: no-store` by default).
+ *  HAZARD: a bare numeric payload is indistinguishable from a status code —
+ *  `jsonResponse(42)` is a status-42 response with an undefined body, not a
+ *  200 whose body is `42`. Use `jsonBodyResponse(42)` for that. New code
+ *  should call the named forms directly. */
 export function jsonResponse(a, b, c) {
   return typeof a === 'number' ? statusFirstJson(a, b, c) : bodyFirstJson(a, b, c);
 }
@@ -142,7 +185,7 @@ function _errorResponse(statusCode, error, extraHeaders, cors = true) {
   const base = jsonHeadersFor(cors);
   return {
     statusCode,
-    headers: extraHeaders ? { ...base, ...extraHeaders } : base,
+    headers: extraHeaders ? mergeHeadersInto({ ...base }, extraHeaders) : base,
     body: JSON.stringify({ error }),
   };
 }
@@ -207,6 +250,8 @@ export function createResponders(opts) {
   return {
     jsonResponse: (a, b, c) =>
       (typeof a === 'number' ? statusFirstJson(a, b, c, cors) : bodyFirstJson(a, b, c, cors)),
+    jsonBodyResponse: (body, cacheControl, extraHeaders) => bodyFirstJson(body, cacheControl, extraHeaders, cors),
+    jsonStatusResponse: (statusCode, obj, o) => statusFirstJson(statusCode, obj, o, cors),
     errorResponse: err,
     textResponse: (statusCode, body, o) => _textResponse(statusCode, body, o, cors),
     ok: (body) => bodyFirstJson(body, undefined, undefined, cors),
@@ -678,10 +723,13 @@ export async function safeFetch(url, init = {}) {
 // per-query-billed request, but give the one attempt a hard deadline).
 //
 // NOT the same contract as @jfs/fetch-kit's fetchWithRetry: this one does not
-// retry 429 unless the caller opts in (retryOn429), ignores Retry-After, and
-// returns the Response (ok or not) instead of throwing; fetch-kit's retries
-// 429 by default, honors Retry-After, and throws HttpError on any non-ok
-// status.
+// retry 429 unless the caller opts in (retryOn429) and returns the Response
+// (ok or not) instead of throwing; fetch-kit's retries 429 by default and
+// throws HttpError on any non-ok status. Both honor a Retry-After header
+// (delta-seconds or HTTP-date) on a response they are about to retry — here
+// the honored delay is CAPPED at capMs (a server asking for a long wait never
+// stretches a serverless invocation past the configured ceiling), clamped to
+// ≥ 0, and falls back to the jittered backoff when absent or unparseable.
 
 export const RETRYABLE_STATUSES = new Set([502, 503, 504]);
 const DEFAULT_RETRIES = 2; // total attempts = retries + 1
@@ -693,6 +741,20 @@ const _sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function fullJitter(attempt, baseMs, capMs, rng) {
   const exp = Math.min(capMs, baseMs * Math.pow(2, attempt));
   return Math.floor(rng() * exp);
+}
+
+// Parse a response's Retry-After header into a delay in ms: delta-seconds
+// ('120') or an HTTP-date (relative to now). Returns null when the header is
+// absent or unparseable (caller falls back to the jittered backoff). Tolerates
+// mock responses without a Headers object.
+function _retryAfterMs(res) {
+  const h = res && res.headers;
+  const raw = h && typeof h.get === 'function' ? h.get('retry-after') : null;
+  if (!raw) return null;
+  const s = String(raw).trim();
+  if (/^\d+$/.test(s)) return Number(s) * 1000;
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? null : t - Date.now();
 }
 
 function _attemptTimeoutError(ms) {
@@ -741,19 +803,25 @@ export async function fetchWithRetry(url, init, opts) {
 
   let lastErr = null;
   for (let attempt = 0; attempt <= retries; attempt++) {
+    let retryAfterMs = null;
     try {
       const r = attemptTimeoutMs == null
         ? await fetchFn(url, init)
         : await _attemptWithDeadline(fetchFn, url, init, attemptTimeoutMs);
       const isRetryable = RETRYABLE_STATUSES.has(r.status) || (retryOn429 && r.status === 429);
       if (!isRetryable || attempt === retries) return r;
+      retryAfterMs = _retryAfterMs(r);
       try { await r.body?.cancel?.(); } catch { /* best effort */ }
     } catch (e) {
       if (e?.name === 'AbortError' || init?.signal?.aborted) throw e;
       lastErr = e;
       if (attempt === retries) throw e;
     }
-    await sleepFn(fullJitter(attempt, baseMs, capMs, rng));
+    // A parseable Retry-After on the retryable response overrides the jittered
+    // backoff — capped at capMs, never negative.
+    await sleepFn(retryAfterMs != null
+      ? Math.max(0, Math.min(retryAfterMs, capMs))
+      : fullJitter(attempt, baseMs, capMs, rng));
   }
   throw lastErr || new Error('fetchWithRetry: exhausted retries');
 }

@@ -10,6 +10,8 @@ import {
   preflightResponse,
   JSON_HEADERS,
   jsonResponse,
+  jsonBodyResponse,
+  jsonStatusResponse,
   errorResponse,
   textResponse,
   ok,
@@ -92,7 +94,7 @@ function eventWith({ headers = {}, method, rawQuery } = {}) {
 test('corsHeaders + JSON_HEADERS', () => {
   assert.equal(corsHeaders['Access-Control-Allow-Origin'], '*');
   assert.equal(corsHeaders['X-Content-Type-Options'], 'nosniff');
-  assert.equal(JSON_HEADERS['Content-Type'], 'application/json');
+  assert.equal(JSON_HEADERS['Content-Type'], 'application/json; charset=utf-8');
   assert.equal(JSON_HEADERS['Access-Control-Allow-Origin'], '*');
 });
 
@@ -113,7 +115,7 @@ test('preflightResponse: advertises verbs', () => {
 test('jsonResponse body-first (market-monitor form)', () => {
   const r = jsonResponse({ a: 1 }, 'no-store', { ETag: 'x' });
   assert.equal(r.statusCode, 200);
-  assert.equal(r.headers['Content-Type'], 'application/json');
+  assert.equal(r.headers['Content-Type'], 'application/json; charset=utf-8');
   assert.equal(r.headers['Access-Control-Allow-Origin'], '*');
   assert.equal(r.headers['Cache-Control'], 'no-store');
   assert.equal(r.headers.ETag, 'x');
@@ -125,13 +127,62 @@ test('jsonResponse body-first (market-monitor form)', () => {
 test('jsonResponse status-first (Surf-Tracker form)', () => {
   const r = jsonResponse(404, { error: 'nope' });
   assert.equal(r.statusCode, 404);
-  assert.equal(r.headers['content-type'], 'application/json; charset=utf-8');
-  assert.equal(r.headers['cache-control'], 'no-store');
-  assert.equal(r.headers['access-control-allow-origin'], '*');
+  assert.equal(r.headers['Content-Type'], 'application/json; charset=utf-8');
+  assert.equal(r.headers['Cache-Control'], 'no-store');
+  assert.equal(r.headers['Access-Control-Allow-Origin'], '*');
   assert.equal(r.body, '{"error":"nope"}');
   const custom = jsonResponse(200, { ok: 1 }, { cacheControl: 'max-age=60', headers: { 'x-h': '1' } });
-  assert.equal(custom.headers['cache-control'], 'max-age=60');
+  assert.equal(custom.headers['Cache-Control'], 'max-age=60');
   assert.equal(custom.headers['x-h'], '1');
+});
+
+// The EXACT emitted header sets, pinned deliberately: header-shape drift
+// between the two jsonResponse branches is the bug 0.8.0 fixed, so any future
+// change to either shape must edit this test on purpose.
+test('json response header shapes are pinned (both branches, exact)', () => {
+  assert.deepEqual(jsonBodyResponse({ a: 1 }).headers, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'X-Content-Type-Options': 'nosniff',
+    // NOTE: no Cache-Control — body-first never emits one unless asked
+    // (consumers rely on that for CDN-cacheable proxies).
+  });
+  assert.deepEqual(jsonStatusResponse(404, { error: 'nope' }).headers, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store', // status-first defaults to no-store
+    'Access-Control-Allow-Origin': '*',
+  });
+});
+
+test('named forms delegate to the same implementations as the overload', () => {
+  assert.deepEqual(jsonBodyResponse({ a: 1 }, 'no-store', { ETag: 'x' }), jsonResponse({ a: 1 }, 'no-store', { ETag: 'x' }));
+  assert.deepEqual(jsonStatusResponse(429, { error: 'rl' }, { cacheControl: 'no-store' }), jsonResponse(429, { error: 'rl' }, { cacheControl: 'no-store' }));
+});
+
+// The overload's documented hazard: a bare numeric payload dispatches as a
+// STATUS CODE, not a body. The named forms are how to say each unambiguously.
+test('jsonResponse numeric first argument always dispatches status-first', () => {
+  const r = jsonResponse(42);
+  assert.equal(r.statusCode, 42); // 42 became the status…
+  assert.equal(r.body, undefined); // …and the body is JSON.stringify(undefined)
+  const b = jsonBodyResponse(42);
+  assert.equal(b.statusCode, 200);
+  assert.equal(b.body, '42');
+});
+
+// Caller header overrides replace the kit defaults even when the caller's key
+// casing differs — never a duplicate pair of same-name headers.
+test('header overrides merge case-insensitively (caller casing wins)', () => {
+  const s = jsonStatusResponse(200, { ok: 1 }, { headers: { 'cache-control': 'public, max-age=60' } });
+  assert.equal(s.headers['cache-control'], 'public, max-age=60');
+  assert.ok(!('Cache-Control' in s.headers));
+  const b = jsonBodyResponse({ ok: 1 }, 'no-store', { 'cache-control': 'public, max-age=60', 'content-type': 'application/vnd.x+json' });
+  assert.equal(b.headers['cache-control'], 'public, max-age=60');
+  assert.ok(!('Cache-Control' in b.headers));
+  assert.equal(b.headers['content-type'], 'application/vnd.x+json');
+  assert.ok(!('Content-Type' in b.headers));
 });
 
 test('errorResponse: { error } body + extraHeaders', () => {
@@ -195,22 +246,26 @@ test('createResponders({ cors: false }): identical shapes, zero CORS headers', (
   const bf = n.jsonResponse({ a: 1 }, 'no-store', { ETag: 'x' });
   assertNoCorsHeaders(bf);
   assert.equal(bf.statusCode, 200);
-  assert.equal(bf.headers['Content-Type'], 'application/json');
+  assert.equal(bf.headers['Content-Type'], 'application/json; charset=utf-8');
   assert.equal(bf.headers['X-Content-Type-Options'], 'nosniff');
   assert.equal(bf.headers['Cache-Control'], 'no-store');
   assert.equal(bf.headers.ETag, 'x');
   assert.equal(bf.body, '{"a":1}');
 
-  // status-first JSON: no access-control-allow-origin unless explicitly asked.
+  // status-first JSON: no Access-Control-Allow-Origin unless explicitly asked.
   const sf = n.jsonResponse(404, { error: 'nope' });
   assertNoCorsHeaders(sf);
   assert.equal(sf.statusCode, 404);
-  assert.equal(sf.headers['content-type'], 'application/json; charset=utf-8');
-  assert.equal(sf.headers['cache-control'], 'no-store');
+  assert.equal(sf.headers['Content-Type'], 'application/json; charset=utf-8');
+  assert.equal(sf.headers['Cache-Control'], 'no-store');
   assert.equal(sf.body, '{"error":"nope"}');
   // ... an explicit per-call corsOrigin always means it, even with cors:false.
   const explicit = n.jsonResponse(200, { ok: 1 }, { corsOrigin: 'https://app.example' });
-  assert.equal(explicit.headers['access-control-allow-origin'], 'https://app.example');
+  assert.equal(explicit.headers['Access-Control-Allow-Origin'], 'https://app.example');
+
+  // the named forms are on the configured set too, same no-CORS shapes.
+  assert.deepEqual(n.jsonBodyResponse({ a: 1 }, 'no-store', { ETag: 'x' }), bf);
+  assert.deepEqual(n.jsonStatusResponse(404, { error: 'nope' }), sf);
 
   // text: same content-type, no CORS; opt-in cache-control still works.
   const t = n.textResponse(200, 'hello', { cacheControl: 'no-store' });
@@ -466,6 +521,73 @@ test('fetchWithRetry: retries 503 then succeeds', async () => {
   const r = await fetchWithRetry('u', {}, { fetchFn, sleepFn: noSleep, retries: 3 });
   assert.equal(r.status, 200);
   assert.equal(n, 3);
+});
+
+// ── Retry-After (0.8.0): a retryable response's Retry-After header sets the
+//    backoff delay, capped at capMs; absent/unparseable falls back to jitter.
+
+// A mock retryable response whose Headers only carry Retry-After.
+const res503 = (retryAfter) => ({
+  status: 503,
+  headers: { get: (k) => (k.toLowerCase() === 'retry-after' && retryAfter != null ? retryAfter : null) },
+  body: { cancel: async () => {} },
+});
+// One 503 (with the given Retry-After) then a 200; returns the recorded sleeps.
+async function sleepsFor(retryAfter, opts = {}) {
+  const sleeps = [];
+  let n = 0;
+  const fetchFn = async () => (n++ === 0 ? res503(retryAfter) : { status: 200 });
+  const r = await fetchWithRetry('u', {}, {
+    fetchFn,
+    sleepFn: async (ms) => { sleeps.push(ms); },
+    retries: 2,
+    capMs: 2000,
+    rng: () => 0, // computed jitter backoff would be 0 — any positive sleep proves Retry-After won
+    ...opts,
+  });
+  assert.equal(r.status, 200);
+  return sleeps;
+}
+
+test('fetchWithRetry: Retry-After delta-seconds sets the delay', async () => {
+  assert.deepEqual(await sleepsFor('1'), [1000]);
+});
+
+test('fetchWithRetry: Retry-After HTTP-date sets the delay (relative to now)', async () => {
+  // ~1.5s ahead; toUTCString truncates ms, so accept anything in (0, 1500].
+  const [ms] = await sleepsFor(new Date(Date.now() + 1500).toUTCString());
+  assert.ok(ms > 0 && ms <= 1500, `expected 0 < delay <= 1500, got ${ms}`);
+  // a date in the past clamps to 0, never negative.
+  const [past] = await sleepsFor(new Date(Date.now() - 60_000).toUTCString());
+  assert.equal(past, 0);
+});
+
+test('fetchWithRetry: Retry-After is capped at capMs, never extended', async () => {
+  assert.deepEqual(await sleepsFor('60'), [2000]); // 60s asked, capMs 2000 wins
+  assert.deepEqual(await sleepsFor(new Date(Date.now() + 300_000).toUTCString()), [2000]);
+});
+
+test('fetchWithRetry: absent or unparseable Retry-After falls back to jittered backoff', async () => {
+  // rng fixed at 0.5, baseMs 200 → attempt-0 backoff = floor(0.5 * 200) = 100.
+  const jitterOpts = { rng: () => 0.5, baseMs: 200 };
+  assert.deepEqual(await sleepsFor(null, jitterOpts), [100]);
+  assert.deepEqual(await sleepsFor('soon', jitterOpts), [100]);
+  // headerless mock responses (like the ones elsewhere in this file) also fall back.
+  let n = 0;
+  const sleeps = [];
+  const fetchFn = async () => (n++ === 0 ? { status: 503, body: { cancel: async () => {} } } : { status: 200 });
+  await fetchWithRetry('u', {}, { fetchFn, sleepFn: async (ms) => { sleeps.push(ms); }, ...jitterOpts });
+  assert.deepEqual(sleeps, [100]);
+});
+
+test('fetchWithRetry: Retry-After honored on 429 too when retryOn429 is set', async () => {
+  const sleeps = [];
+  let n = 0;
+  const res429 = { ...res503('1'), status: 429 };
+  const fetchFn = async () => (n++ === 0 ? res429 : { status: 200 });
+  const r = await fetchWithRetry('u', {}, { fetchFn, sleepFn: async (ms) => { sleeps.push(ms); }, retryOn429: true, rng: () => 0 });
+  assert.equal(r.status, 200);
+  assert.deepEqual(sleeps, [1000]);
 });
 
 test('fetchWithRetry: no retry on 400; 429 opt-in; network retried; AbortError not', async () => {
