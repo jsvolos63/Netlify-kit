@@ -676,6 +676,12 @@ export async function safeFetch(url, init = {}) {
 // which, paired with `attemptTimeoutMs`, is the billed-upstream shape
 // (FlightCheck's AeroAPI / Google Distance Matrix calls: never retry a
 // per-query-billed request, but give the one attempt a hard deadline).
+//
+// NOT the same contract as @jfs/fetch-kit's fetchWithRetry: this one does not
+// retry 429 unless the caller opts in (retryOn429), ignores Retry-After, and
+// returns the Response (ok or not) instead of throwing; fetch-kit's retries
+// 429 by default, honors Retry-After, and throws HttpError on any non-ok
+// status.
 
 export const RETRYABLE_STATUSES = new Set([502, 503, 504]);
 const DEFAULT_RETRIES = 2; // total attempts = retries + 1
