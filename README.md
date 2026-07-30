@@ -101,17 +101,6 @@ like `2130706433` / `0x7f000001` / `0177.0.0.1` — no `localhost`/`.internal`/
 `resolveHostIsPublic(hostname)` (fail-closed DNS check that blocks the
 `169.254.169.254` metadata trick), `isPrivateIPv4` / `isPrivateIPv6` /
 `isPrivateAddress`.
-- `safeFetch(url, init?)` (async) — DNS-rebinding-safe HTTPS fetch for
-  caller-supplied URLs. Re-runs `parseSafeHttpsUrl` + a resolve-and-vet on the
-  initial URL **and every redirect Location** (manual redirect handling, capped
-  at `init.maxRedirects` = 5; an `http:` downgrade is rejected), and pins the
-  socket to the exact vetted IP via the `lookup` option while keeping the
-  hostname for the Host header + TLS SNI — so a second resolution can't swap in
-  a private address (TOCTOU). Bounded by `init.timeoutMs` (default 10 s) with
-  the body read through `readTextCapped` (`init.maxBytes`, default
-  `MAX_RESPONSE_BYTES`). Returns a small Response-like
-  `{ ok, status, headers: { get(name), raw }, url, text() }`; throws on a
-  blocked URL/host, a redirect past the cap, a timeout, or a transport error.
 
 **Retry** — `fetchWithRetry(url, init, opts)` (exp backoff + full jitter;
 retries network errors + 502/503/504, 429 only with `retryOn429`; a
@@ -181,9 +170,8 @@ api key or the raw upstream body, and `.status`/`.retryAfter` tagging.
   tagged `retryAfter`; `detail` otherwise.
 - `normalizeEffort(value, def='low')` — validate an env-configured
   `output_config.effort` level (`low`…`max`).
-- `ANTHROPIC_VERSION`, `ANTHROPIC_DEFAULT_MODEL` (+ `DEFAULT_MODEL` alias,
-  Surf-Tracker's name) — Opus 4.8; pair with explicit `effort` to stay inside
-  a synchronous function's time budget.
+- `ANTHROPIC_VERSION`, `DEFAULT_MODEL` — Opus 4.8; pair with explicit
+  `effort` to stay inside a synchronous function's time budget.
 
 ## Vendoring into a consumer
 
