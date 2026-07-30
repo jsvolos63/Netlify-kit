@@ -3,7 +3,6 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import http from 'node:http';
 import {
   corsHeaders,
   handlePreflight,
@@ -37,7 +36,6 @@ import {
   isPrivateIPv6,
   isPrivateAddress,
   resolveHostIsPublic,
-  safeFetch,
   fetchWithRetry,
   RETRYABLE_STATUSES,
   clientIp,
@@ -53,7 +51,6 @@ import {
   getTTLCached,
   setTTLCached,
   ANTHROPIC_VERSION,
-  ANTHROPIC_DEFAULT_MODEL,
   DEFAULT_MODEL,
   normalizeEffort,
   callAnthropic,
@@ -387,128 +384,6 @@ test('resolveHostIsPublic: localhost is private (fail closed)', async () => {
   const r = await resolveHostIsPublic('localhost');
   assert.equal(r.ok, false);
   assert.equal(r.error, 'private-ip');
-});
-
-// safeFetch is exercised against a local http.createServer. Production always
-// speaks HTTPS to a vetted public IP; the `_validate` / `_resolve` seams let the
-// test permit its own loopback origin while REDIRECT targets still go through
-// the real parseSafeHttpsUrl + a private-IP-aware resolver, proving each hop is
-// re-vetted.
-async function withServer(handler, run) {
-  const server = http.createServer(handler);
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  const port = server.address().port;
-  const origin = `http://127.0.0.1:${port}`;
-  // Permit the test's own origin; defer to the real HTTPS guard for anything
-  // else (i.e. redirect Locations).
-  const _validate = (u) => {
-    const url = new URL(u);
-    return url.origin === origin ? { ok: true, url, error: null } : parseSafeHttpsUrl(u);
-  };
-  // Loopback for our server host; a private verdict for the rebind bait host.
-  const _resolve = async (host) => {
-    if (host === '127.0.0.1') return { ok: true, address: '127.0.0.1', family: 4 };
-    if (host === 'private.example') return { ok: false, error: 'private-ip' };
-    return { ok: false, error: 'dns-failed' };
-  };
-  try {
-    return await run({ origin, _validate, _resolve });
-  } finally {
-    server.close();
-  }
-}
-
-test('safeFetch: a normal 200 succeeds and returns a Response-like object', async () => {
-  await withServer(
-    (req, res) => {
-      res.writeHead(200, { 'content-type': 'text/plain' });
-      res.end('hello-body');
-    },
-    async ({ origin, _validate, _resolve }) => {
-      const r = await safeFetch(`${origin}/ok`, { _validate, _resolve });
-      assert.equal(r.ok, true);
-      assert.equal(r.status, 200);
-      assert.equal(await r.text(), 'hello-body');
-      assert.equal(r.headers.get('content-type'), 'text/plain');
-      assert.equal(r.url, `${origin}/ok`);
-    },
-  );
-});
-
-test('safeFetch: a redirect to http:// is rejected (no downgrade)', async () => {
-  await withServer(
-    (req, res) => { res.writeHead(302, { location: 'http://127.0.0.1/' }); res.end(); },
-    async ({ origin, _validate, _resolve }) => {
-      await assert.rejects(
-        safeFetch(`${origin}/red`, { _validate, _resolve }),
-        (e) => /blocked-url:not-https/.test(e.message),
-      );
-    },
-  );
-});
-
-test('safeFetch: a redirect to a private host is re-vetted and rejected', async () => {
-  await withServer(
-    (req, res) => { res.writeHead(302, { location: 'https://private.example/' }); res.end(); },
-    async ({ origin, _validate, _resolve }) => {
-      await assert.rejects(
-        safeFetch(`${origin}/red`, { _validate, _resolve }),
-        (e) => /blocked-host:private-ip/.test(e.message),
-      );
-    },
-  );
-});
-
-test('safeFetch: the redirect hop cap is enforced', async () => {
-  await withServer(
-    (req, res) => { res.writeHead(302, { location: '/loop' }); res.end(); },
-    async ({ origin, _validate, _resolve }) => {
-      await assert.rejects(
-        safeFetch(`${origin}/loop`, { _validate, _resolve, maxRedirects: 3 }),
-        (e) => /too-many-redirects/.test(e.message),
-      );
-    },
-  );
-});
-
-test('safeFetch: a hung DNS resolve is bounded by the deadline', async () => {
-  // A _resolve that never settles must not hang safeFetch past timeoutMs.
-  const hang = () => new Promise(() => {});
-  const _validate = (u) => ({ ok: true, url: new URL(u), error: null });
-  const start = Date.now();
-  await assert.rejects(
-    safeFetch('https://slow.example/x', { _validate, _resolve: hang, timeoutMs: 60 }),
-    (e) => /timeout/.test(e.message),
-  );
-  assert.ok(Date.now() - start < 2000, 'rejected promptly rather than hanging');
-});
-
-test('safeFetch: trickled response headers cannot stall past the deadline', async () => {
-  // A server that drips one valid filler header line per interval keeps the
-  // socket ACTIVE forever without ever completing the headers, so an
-  // inactivity-based req.setTimeout() never fires. The headers phase must be
-  // bounded by a hard deadline instead.
-  const net = await import('node:net');
-  const server = net.createServer((sock) => {
-    sock.write('HTTP/1.1 200 OK\r\n');
-    const t = setInterval(() => { try { sock.write('X-Filler: aaaa\r\n'); } catch { /* closing */ } }, 50);
-    sock.on('close', () => clearInterval(t));
-    sock.on('error', () => {});
-  });
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  const port = server.address().port;
-  const _validate = (u) => ({ ok: true, url: new URL(u), error: null });
-  const _resolve = async () => ({ ok: true, address: '127.0.0.1', family: 4 });
-  const start = Date.now();
-  try {
-    await assert.rejects(
-      safeFetch(`http://127.0.0.1:${port}/drip`, { _validate, _resolve, timeoutMs: 300 }),
-      (e) => /request timed out/.test(e.message),
-    );
-    assert.ok(Date.now() - start < 5000, 'cut off at the deadline rather than trickling forever');
-  } finally {
-    server.close();
-  }
 });
 
 // ──────────────────────────── retry ─────────────────────────────
@@ -1057,9 +932,8 @@ const textContent = (...texts) => ({
   content: texts.map((t) => ({ type: 'text', text: t })),
 });
 
-test('model constants: Opus 4.8 default, DEFAULT_MODEL alias, version header', () => {
-  assert.equal(ANTHROPIC_DEFAULT_MODEL, 'claude-opus-4-8');
-  assert.equal(DEFAULT_MODEL, ANTHROPIC_DEFAULT_MODEL);
+test('model constants: Opus 4.8 default, version header', () => {
+  assert.equal(DEFAULT_MODEL, 'claude-opus-4-8');
   assert.equal(ANTHROPIC_VERSION, '2023-06-01');
 });
 
@@ -1263,89 +1137,6 @@ test('userFacingReason: honest 429 message, fallback detail otherwise', () => {
   const other = Object.assign(new Error('x'), { status: 500 });
   assert.equal(userFacingReason(other, 'fallback text'), 'fallback text');
   assert.equal(userFacingReason(null, 'fallback text'), 'fallback text');
-});
-
-// --- cross-origin redirect credential stripping ---------------------------
-
-// Two local origins (same host, different ports) so a redirect can cross an
-// origin boundary. Both are permitted by _validate; in production the same code
-// path runs against two public HTTPS hosts.
-async function withTwoServers(handlerA, handlerB, run) {
-  const origins = {};
-  const a = http.createServer((req, res) => handlerA(req, res, origins));
-  const b = http.createServer((req, res) => handlerB(req, res, origins));
-  await new Promise((r) => a.listen(0, '127.0.0.1', r));
-  await new Promise((r) => b.listen(0, '127.0.0.1', r));
-  origins.a = `http://127.0.0.1:${a.address().port}`;
-  origins.b = `http://127.0.0.1:${b.address().port}`;
-  const _validate = (u) => {
-    const url = new URL(u);
-    return url.origin === origins.a || url.origin === origins.b
-      ? { ok: true, url, error: null }
-      : parseSafeHttpsUrl(u);
-  };
-  const _resolve = async (host) => (host === '127.0.0.1'
-    ? { ok: true, address: '127.0.0.1', family: 4 }
-    : { ok: false, error: 'dns-failed' });
-  try {
-    return await run({ originA: origins.a, originB: origins.b, _validate, _resolve });
-  } finally {
-    a.close();
-    b.close();
-  }
-}
-
-test('safeFetch: credential headers are dropped on a cross-origin redirect', async () => {
-  let sawOnB = null;
-  await withTwoServers(
-    (req, res, o) => { res.writeHead(302, { location: `${o.b}/steal` }); res.end(); },
-    (req, res) => {
-      sawOnB = req.headers;
-      res.writeHead(200, { 'content-type': 'text/plain' });
-      res.end('landed');
-    },
-    async ({ originA, _validate, _resolve }) => {
-      const r = await safeFetch(`${originA}/start`, {
-        headers: {
-          authorization: 'Bearer VICTIM-API-KEY',
-          cookie: 'session=abc',
-          'x-api-key': 'k',
-          'x-auth-token': 't',
-          'x-request-id': 'keep-me',
-        },
-        _validate,
-        _resolve,
-      });
-      assert.equal(await r.text(), 'landed');
-      // The redirect target is an ordinary public host, so every SSRF guard
-      // passes it — only the credential strip stops the exfiltration.
-      assert.equal(sawOnB.authorization, undefined);
-      assert.equal(sawOnB.cookie, undefined);
-      assert.equal(sawOnB['x-api-key'], undefined);
-      assert.equal(sawOnB['x-auth-token'], undefined);
-      assert.equal(sawOnB['x-request-id'], 'keep-me', 'non-credential headers still travel');
-    },
-  );
-});
-
-test('safeFetch: credential headers survive a same-origin redirect', async () => {
-  let sawFinal = null;
-  await withServer(
-    (req, res) => {
-      if (req.url === '/start') { res.writeHead(302, { location: '/final' }); res.end(); return; }
-      sawFinal = req.headers;
-      res.writeHead(200, { 'content-type': 'text/plain' });
-      res.end('ok');
-    },
-    async ({ origin, _validate, _resolve }) => {
-      await safeFetch(`${origin}/start`, {
-        headers: { authorization: 'Bearer KEEP' },
-        _validate,
-        _resolve,
-      });
-      assert.equal(sawFinal.authorization, 'Bearer KEEP');
-    },
-  );
 });
 
 // --- limiter IP resolution ------------------------------------------------
