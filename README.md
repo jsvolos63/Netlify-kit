@@ -102,6 +102,17 @@ like `2130706433` / `0x7f000001` / `0177.0.0.1` — no `localhost`/`.internal`/
 `169.254.169.254` metadata trick), `isPrivateIPv4` / `isPrivateIPv6` /
 `isPrivateAddress`.
 
+**Guarded article fetch** (0.9.0) — the shared halves of the family's
+article-reader extract functions: `assertSafePublicUrl(candidate)` (both SSRF
+guards on one URL, throws or returns the normalized string),
+`fetchHtmlGuarded(startUrl, { headers, timeoutMs, maxBytes, maxRedirects })`
+(manual redirect handling with BOTH guards re-run on every hop, byte-capped
+read; never hand a URL to a library that follows redirects itself — fetch
+here, give it HTML), `raceProxyHtml(target, proxies, parse, opts)` (race
+public CORS proxies, status/size/shape-checked, first result the caller's
+`parse(html, target)` accepts wins; rejects with `AggregateError` when all
+fail).
+
 **Retry** — `fetchWithRetry(url, init, opts)` (exp backoff + full jitter;
 retries network errors + 502/503/504, 429 only with `retryOn429`; a
 `Retry-After` header on a retryable response sets the delay — capped at

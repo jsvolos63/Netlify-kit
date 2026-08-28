@@ -2,7 +2,9 @@
 
 Shared, dependency-free Netlify Functions primitives (CORS + preflight,
 JSON/text/error responses, capped body reads, input validation, SSRF
-guards, retry-with-backoff fetch, per-IP rate limiting, a Blobs store
+guards, the guarded article fetch behind the family's reader extract
+functions — per-hop-revalidated redirects + the CORS-proxy race —
+retry-with-backoff fetch, per-IP rate limiting, a Blobs store
 opener + short-TTL cache, a `createHandler` boundary, and a hardened
 Anthropic Messages-API client) extracted from the JFS family of buildless
 static sites. Consumers vendor this kit via its own CLI rather than

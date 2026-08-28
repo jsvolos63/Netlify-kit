@@ -36,6 +36,9 @@ import {
   isPrivateIPv6,
   isPrivateAddress,
   resolveHostIsPublic,
+  assertSafePublicUrl,
+  fetchHtmlGuarded,
+  raceProxyHtml,
   fetchWithRetry,
   RETRYABLE_STATUSES,
   clientIp,
@@ -1178,4 +1181,134 @@ test('rateLimit: well-formed IPv6 addresses still get their own buckets', () => 
     assert.equal(rateLimit(ev(ip), opts).ok, true, ip);
   }
   assert.equal(rateLimit(ev('2001:db8::1'), opts).ok, false, 'a repeat hit on the same address is limited');
+});
+
+// ─────────────── guarded article fetch (0.9.0) ───────────────
+//
+// fetchHtmlGuarded / raceProxyHtml drive the real global fetch, so these
+// tests stub globalThis.fetch and restore it. None of them touch DNS: the
+// redirect-cap check runs BEFORE the per-hop guard, and unsafe-hop cases use
+// URLs the string-level guard rejects without a lookup.
+
+const savedFetch = globalThis.fetch;
+function withFetch(fn, run) {
+  globalThis.fetch = fn;
+  return run().finally(() => { globalThis.fetch = savedFetch; });
+}
+// Minimal Response-shaped stub with a streamable body for readTextCapped.
+function htmlRes(status, body, headers = {}) {
+  const bytes = new TextEncoder().encode(body);
+  return {
+    status,
+    ok: status >= 200 && status < 300,
+    headers: { get: (k) => headers[k.toLowerCase()] ?? null },
+    body: {
+      cancel: async () => {},
+      getReader: () => {
+        let done = false;
+        return {
+          read: async () => (done ? { done: true } : ((done = true), { done: false, value: bytes })),
+          cancel: async () => {},
+        };
+      },
+    },
+  };
+}
+
+test('assertSafePublicUrl: rejects without DNS on string-level failures', async () => {
+  await assert.rejects(() => assertSafePublicUrl('http://example.com/a'), /unsafe redirect target/);
+  await assert.rejects(() => assertSafePublicUrl('https://localhost/a'), /unsafe redirect target/);
+  await assert.rejects(() => assertSafePublicUrl('https://169.254.169.254/latest'), /unsafe redirect target/);
+});
+
+test('fetchHtmlGuarded: returns the final page html and url', async () => {
+  await withFetch(async (url, init) => {
+    assert.equal(init.redirect, 'manual');
+    return htmlRes(200, '<html>hi</html>');
+  }, async () => {
+    const r = await fetchHtmlGuarded('https://example.com/story');
+    assert.equal(r.html, '<html>hi</html>');
+    assert.equal(r.finalUrl, 'https://example.com/story');
+  });
+});
+
+test('fetchHtmlGuarded: non-ok status throws', async () => {
+  await withFetch(async () => htmlRes(404, 'nope'), async () => {
+    await assert.rejects(() => fetchHtmlGuarded('https://example.com/x'), /HTTP 404/);
+  });
+});
+
+test('fetchHtmlGuarded: oversized body throws instead of buffering', async () => {
+  await withFetch(async () => htmlRes(200, 'x'.repeat(64)), async () => {
+    await assert.rejects(() => fetchHtmlGuarded('https://example.com/x', { maxBytes: 16 }));
+  });
+});
+
+test('fetchHtmlGuarded: redirect cap is enforced before any hop is fetched', async () => {
+  let calls = 0;
+  await withFetch(async () => {
+    calls++;
+    return htmlRes(301, '', { location: 'https://example.com/next' });
+  }, async () => {
+    await assert.rejects(
+      () => fetchHtmlGuarded('https://example.com/x', { maxRedirects: 0 }),
+      /too many redirects/
+    );
+    assert.equal(calls, 1, 'the hop past the cap must never be fetched');
+  });
+});
+
+test('fetchHtmlGuarded: a redirect to a non-https target is refused (no fetch of the hop)', async () => {
+  let calls = 0;
+  await withFetch(async () => {
+    calls++;
+    return htmlRes(302, '', { location: 'http://internal.service/admin' });
+  }, async () => {
+    await assert.rejects(() => fetchHtmlGuarded('https://example.com/x'), /unsafe redirect target/);
+    assert.equal(calls, 1);
+  });
+});
+
+test('fetchHtmlGuarded: a 3xx with no Location throws', async () => {
+  await withFetch(async () => htmlRes(301, ''), async () => {
+    await assert.rejects(() => fetchHtmlGuarded('https://example.com/x'), /redirect without location/);
+  });
+});
+
+test('raceProxyHtml: first proxy whose html the parser accepts wins', async () => {
+  const proxies = [
+    (u) => 'https://p1.example/?u=' + encodeURIComponent(u),
+    (u) => 'https://p2.example/?u=' + encodeURIComponent(u),
+  ];
+  await withFetch(async (url) => {
+    if (url.startsWith('https://p1.example/')) return htmlRes(200, '{"error":"rate limited"}');
+    return htmlRes(200, '<html><p>story body</p></html>');
+  }, async () => {
+    const article = await raceProxyHtml('https://pub.example/story', proxies, async (html, target) => {
+      assert.equal(target, 'https://pub.example/story');
+      return { content: html };
+    });
+    assert.match(article.content, /story body/);
+  });
+});
+
+test('raceProxyHtml: non-html and parser rejections skip to the next proxy; all-fail rejects', async () => {
+  const proxies = [(u) => 'https://p1.example/' + u, (u) => 'https://p2.example/' + u];
+  await withFetch(async () => htmlRes(200, '<html><p>looks fine</p></html>'), async () => {
+    await assert.rejects(
+      () => raceProxyHtml('https://pub.example/story', proxies, async () => { throw new Error('no content'); }),
+      (e) => e instanceof AggregateError
+    );
+  });
+});
+
+test('raceProxyHtml: a proxy error status is a rejection for that proxy only', async () => {
+  const proxies = [(u) => 'https://p1.example/' + u, (u) => 'https://p2.example/' + u];
+  await withFetch(async (url) => {
+    if (url.startsWith('https://p1.example/')) return htmlRes(502, 'bad gateway');
+    return htmlRes(200, '<article>real</article>');
+  }, async () => {
+    const got = await raceProxyHtml('https://pub.example/story', proxies, async (html) => ({ content: html }));
+    assert.match(got.content, /real/);
+  });
 });
