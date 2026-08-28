@@ -498,6 +498,110 @@ export async function resolveHostIsPublic(hostname) {
   return { ok: true, error: null };
 }
 
+// ──────────────────── guarded article fetch ─────────────────────
+//
+// The article-reader extract functions (market-monitor, Surf-Tracker,
+// John's News) each carried a verbatim copy of this trio, and the copies
+// drifted exactly once in the way that matters: one consumer handed its URL
+// to a library that follows redirects internally with NO SSRF re-validation,
+// so a publisher URL with an open redirect could be walked to an internal
+// host after the initial guards passed. Per the family extraction bar (a
+// third consumer AND a real drift bug), the shared halves live here now.
+// The kit stays dependency-free: parsing the fetched HTML into an article is
+// the caller's job (they pass their extractor as a callback).
+
+/** Run BOTH SSRF guards — the string-level rules and the resolved-IP
+ *  private-range check — on a candidate URL. Returns the normalized URL
+ *  string, or throws. Apply to every redirect hop, not just the first URL. */
+export async function assertSafePublicUrl(candidate) {
+  const parsed = parseSafeHttpsUrl(candidate);
+  if (!parsed.ok) throw new Error('unsafe redirect target');
+  if (!(await resolveHostIsPublic(parsed.url.hostname)).ok) {
+    throw new Error('redirect resolves to a private host');
+  }
+  return parsed.url.toString();
+}
+
+/** Direct server-side fetch of a page's HTML with MANUAL redirect handling,
+ *  re-validating every hop through assertSafePublicUrl. `startUrl` must
+ *  already be validated by the caller (this function guards the hops it
+ *  discovers, not the URL it was handed). Resolves `{ html, finalUrl }`;
+ *  throws on non-ok status, redirect loops, oversized bodies, or an unsafe
+ *  hop. Never hand the URL to a library that follows redirects itself —
+ *  fetch the bytes here and give the library HTML. */
+export async function fetchHtmlGuarded(startUrl, {
+  headers,
+  timeoutMs = 8000,
+  maxBytes = 4 * 1024 * 1024,
+  maxRedirects = 5,
+} = {}) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => { try { ctl.abort(); } catch { /* already settled */ } }, timeoutMs);
+  try {
+    let currentUrl = startUrl;
+    for (let hops = 0; ; hops++) {
+      const res = await fetch(currentUrl, {
+        redirect: 'manual',
+        signal: ctl.signal,
+        headers,
+      });
+      // Non-3xx (or a 3xx with no Location) is the final response — read it.
+      if (res.status < 300 || res.status >= 400) {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const html = await readTextCapped(res, maxBytes);
+        return { html, finalUrl: currentUrl };
+      }
+      const location = res.headers.get('location');
+      if (!location) throw new Error('redirect without location');
+      // Drain the 3xx body so undici can reuse the connection.
+      try { await res.body?.cancel(); } catch { /* best-effort drain */ }
+      if (hops >= maxRedirects) throw new Error('too many redirects');
+      const nextUrl = new URL(location, currentUrl).toString();
+      currentUrl = await assertSafePublicUrl(nextUrl);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Race `target` through public CORS proxies and resolve with the first
+ *  result the caller's `parse(html, target)` accepts (return an article;
+ *  throw to reject that proxy). Each proxy is a `(url) => proxiedUrl`
+ *  builder; its response is status-checked, byte-capped, and sniffed for
+ *  HTML shape before `parse` runs, so a proxy's JSON error page or
+ *  rate-limit notice skips to the next contender. Rejects with the
+ *  AggregateError from Promise.any only when every proxy failed.
+ *  SSRF note: the proxies fetch from THEIR OWN egress, so hop validation
+ *  doesn't apply here — what this function guards is the response size and
+ *  shape. Callers choose their proxy list deliberately; routing content
+ *  through third parties is a per-app decision. */
+export function raceProxyHtml(target, proxies, parse, {
+  headers,
+  timeoutMs = 7000,
+  maxBytes = 4 * 1024 * 1024,
+} = {}) {
+  const one = async (makeUrl) => {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => { try { ctl.abort(); } catch { /* already settled */ } }, timeoutMs);
+    try {
+      const res = await fetch(makeUrl(target), {
+        redirect: 'follow',
+        signal: ctl.signal,
+        headers,
+      });
+      if (!res.ok) throw new Error(`proxy HTTP ${res.status}`);
+      const html = await readTextCapped(res, maxBytes);
+      // Cheap guard so a proxy JSON error / rate-limit page never reaches the
+      // caller's parser; `parse` does the real work of deciding it's an article.
+      if (!/<html|<body|<article|<p[\s>]/i.test(html)) throw new Error('not html');
+      return await parse(html, target);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  return Promise.any(proxies.map(one));
+}
+
 // ──────────────────────────── retry ─────────────────────────────
 //
 // Bounded exponential backoff with full jitter around an async fetch. Retries
