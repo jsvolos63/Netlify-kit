@@ -13,6 +13,35 @@ app bumps its pin and re-runs `vendor:sync`.
 
 <!-- jfs-family-conventions:start — managed by jfs-claude-md-sync; edit family/family-conventions.md in @jfs/vendor-cli -->
 
+## Lint
+
+`npm run lint` (ESLint flat config, `eslint.config.mjs`); CI runs it. Every
+APP in the family already linted; none of the kits did — which left the
+widest-blast-radius code with no second reader, since a bug here lands in
+every consumer's vendored copy as bundler output nobody reads line by line.
+
+Three findings, all fixed rather than silenced:
+
+- Two dead initializers in `checkRateLimitDistributed` — `let data = null` /
+  `let etag = null` are declared INSIDE the retry loop and reassigned in the
+  `try`, whose `catch` returns, so no path ever reads the `null`. Now bare
+  `let`. Not a bug; the point of fixing rather than disabling
+  `no-useless-assignment` is that the rule DOES catch real
+  computed-then-overwritten values, and this kit is where that matters.
+- A `fakeAnthropicResponse({ ok })` parameter in the suite shadowing the
+  kit's own imported `ok()` responder. Destructured as `okFlag` — the emitted
+  property has to stay `ok` to mirror a real `Response`, so the fake's API is
+  unchanged.
+
+Two rules are off, both because they fire on what this kit is FOR:
+`no-control-regex` (the SSRF and header guards strip control characters) and
+`no-regex-spaces` (the vendor suite matches a known two-space indent in
+generated output).
+
+Re-vendoring this kit does not need a consumer site version bump — it is
+server-only everywhere it is used — but it IS version-guarded here, so an
+`index.js` change still needs a bump in this repo.
+
 ## Family conventions
 
 These conventions are identical across every repo in the @jfs family. The

@@ -919,10 +919,12 @@ test('openStore: returns null when @netlify/blobs is unavailable (install-time d
 
 // A minimal Response-shaped fake. `headers.get` is case-insensitive like the
 // real Headers; `json`/`text`/`body` cover both entry points.
-function fakeAnthropicResponse({ ok = true, status = 200, headers = {}, jsonBody, textBody = '', withBody = false } = {}) {
+// `ok` is destructured as okFlag: the property has to stay `ok` to mirror a
+// real Response, but the bare name would shadow this suite's imported ok().
+function fakeAnthropicResponse({ ok: okFlag = true, status = 200, headers = {}, jsonBody, textBody = '', withBody = false } = {}) {
   const lower = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), String(v)]));
   return {
-    ok,
+    ok: okFlag,
     status,
     headers: { get: (name) => (name.toLowerCase() in lower ? lower[name.toLowerCase()] : null) },
     json: async () => jsonBody,
