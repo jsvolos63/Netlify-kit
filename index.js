@@ -926,8 +926,8 @@ export async function checkRateLimitDistributed(event, max = 60, windowMs = 60_0
     tooManyRequestsResponse(Math.max(1, Math.ceil((windowStart + windowMs - now) / 1000)), cors);
 
   for (let attempt = 0; attempt <= retries; attempt++) {
-    let data = null;
-    let etag = null;
+    let data;
+    let etag;
     try {
       const meta = await store.getWithMetadata(key, { type: 'json' });
       data = (meta && meta.data) || null;
