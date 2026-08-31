@@ -11,8 +11,6 @@ static sites. Consumers vendor this kit via its own CLI rather than
 installing it at runtime, so a change here reaches an app only once that
 app bumps its pin and re-runs `vendor:sync`.
 
-<!-- jfs-family-conventions:start — managed by jfs-claude-md-sync; edit family/family-conventions.md in @jfs/vendor-cli -->
-
 ## Lint
 
 `npm run lint` (ESLint flat config, `eslint.config.mjs`); CI runs it. Every
@@ -41,6 +39,8 @@ generated output).
 Re-vendoring this kit does not need a consumer site version bump — it is
 server-only everywhere it is used — but it IS version-guarded here, so an
 `index.js` change still needs a bump in this repo.
+
+<!-- jfs-family-conventions:start — managed by jfs-claude-md-sync; edit family/family-conventions.md in @jfs/vendor-cli -->
 
 ## Family conventions
 
