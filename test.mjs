@@ -185,6 +185,23 @@ test('header overrides merge case-insensitively (caller casing wins)', () => {
   assert.ok(!('Content-Type' in b.headers));
 });
 
+test('errorResponse / handlePreflight / checkResponseSize: never hand back a shared header object', () => {
+  const a = errorResponse(500, 'a');
+  const b = errorResponse(404, 'b');
+  assert.notEqual(a.headers, b.headers);
+  assert.notEqual(a.headers, JSON_HEADERS);
+  a.headers['Retry-After'] = '60';
+  assert.ok(!('Retry-After' in JSON_HEADERS));
+  assert.ok(!('Retry-After' in errorResponse(500, 'c').headers));
+  const pre = handlePreflight(eventWith({ method: 'OPTIONS' }));
+  pre.headers['Access-Control-Allow-Origin'] = 'https://evil.example';
+  assert.equal(corsHeaders['Access-Control-Allow-Origin'], '*');
+  const mine = { 'X-A': '1' };
+  const tooBig = checkResponseSize({ headers: { get: () => String(MAX_RESPONSE_BYTES + 1) } }, mine);
+  tooBig.headers['X-B'] = '2';
+  assert.deepEqual(mine, { 'X-A': '1' });
+});
+
 test('errorResponse: { error } body + extraHeaders', () => {
   const r = errorResponse(400, 'Missing symbol', { 'Retry-After': '5' });
   assert.equal(r.statusCode, 400);
@@ -1139,9 +1156,48 @@ test('userFacingReason: honest 429 message, fallback detail otherwise', () => {
   assert.match(userFacingReason(rate, 'detail'), /about 12s/);
   const rateNoWindow = Object.assign(new Error('x'), { status: 429 });
   assert.match(userFacingReason(rateNoWindow, 'detail'), /a minute/);
-  const other = Object.assign(new Error('x'), { status: 500 });
+  const down = Object.assign(new Error('x'), { status: 500 });
+  assert.match(userFacingReason(down, 'fallback text'), /unavailable right now/);
+  const overloaded = Object.assign(new Error('x'), { status: 529 });
+  assert.match(userFacingReason(overloaded, 'fallback text'), /unavailable right now/);
+  const other = Object.assign(new Error('x'), { status: 400 });
   assert.equal(userFacingReason(other, 'fallback text'), 'fallback text');
   assert.equal(userFacingReason(null, 'fallback text'), 'fallback text');
+});
+
+test('callAnthropic: the upstream body is tagged on the error, never in its message', async () => {
+  const fetchImpl = async () =>
+    fakeAnthropicResponse({ ok: false, status: 401, textBody: '{"error":{"message":"org_01SECRETORG invalid key"}}' });
+  await assert.rejects(
+    callAnthropic({ apiKey: 'k', model: 'm', userText: 'x', maxTokens: 10, timeoutMs: 1400, fetchImpl }),
+    (e) => e.status === 401
+      && e.message === 'api.anthropic.com HTTP 401'
+      && !e.message.includes('SECRETORG')
+      && /SECRETORG/.test(e.upstreamBody),
+  );
+});
+
+test('callAnthropic: an omitted timeoutMs gets a real budget, not a ~1ms abort', async () => {
+  let signalAborted = null;
+  const fetchImpl = async (url, init) => {
+    await new Promise((r) => setTimeout(r, 30));
+    signalAborted = init.signal.aborted;
+    return fakeAnthropicResponse({ jsonBody: textContent('ok') });
+  };
+  assert.equal(await callAnthropic({ apiKey: 'k', model: 'm', userText: 'x', maxTokens: 10, fetchImpl }), 'ok');
+  assert.equal(signalAborted, false);
+  assert.equal(await callAnthropic({ apiKey: 'k', model: 'm', userText: 'x', maxTokens: 10, timeoutMs: NaN, fetchImpl }), 'ok');
+});
+
+test('callAnthropic: an unreadable 2xx body is a host-tagged error, not a bare SyntaxError', async () => {
+  const fetchImpl = async () => ({
+    ...fakeAnthropicResponse(),
+    json: async () => { throw new SyntaxError('Unexpected end of JSON input'); },
+  });
+  await assert.rejects(
+    callAnthropic({ apiKey: 'k', model: 'm', userText: 'x', maxTokens: 10, timeoutMs: 1400, fetchImpl }),
+    (e) => /api\.anthropic\.com/.test(e.message) && e.cause instanceof SyntaxError,
+  );
 });
 
 // --- limiter IP resolution ------------------------------------------------
@@ -1301,6 +1357,24 @@ test('raceProxyHtml: non-html and parser rejections skip to the next proxy; all-
       () => raceProxyHtml('https://pub.example/story', proxies, async () => { throw new Error('no content'); }),
       (e) => e instanceof AggregateError
     );
+  });
+});
+
+test('raceProxyHtml: the losing proxies are aborted once a winner is known', async () => {
+  const proxies = [(u) => 'https://fast.example/' + u, (u) => 'https://slow.example/' + u];
+  let slowSignal = null;
+  await withFetch(async (url, init) => {
+    if (url.startsWith('https://fast.example/')) return htmlRes(200, '<article>real</article>');
+    slowSignal = init.signal;
+    return new Promise((resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+      setTimeout(() => resolve(htmlRes(200, '<article>late</article>')), 5000).unref();
+    });
+  }, async () => {
+    const got = await raceProxyHtml('https://pub.example/story', proxies, async (html) => ({ content: html }));
+    assert.match(got.content, /real/);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(slowSignal.aborted, true);
   });
 });
 
