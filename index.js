@@ -56,7 +56,7 @@ export const corsHeaders = {
  *  The 204 already carries the CORS headers. (market-monitor form.) */
 export function handlePreflight(event) {
   if (event && event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: corsHeaders, body: '' };
+    return { statusCode: 204, headers: { ...corsHeaders }, body: '' };
   }
   return null;
 }
@@ -182,10 +182,13 @@ export function jsonResponse(a, b, c) {
 }
 
 function _errorResponse(statusCode, error, extraHeaders, cors = true) {
-  const base = jsonHeadersFor(cors);
+  // Always a fresh object: `jsonHeadersFor` hands back the module's shared
+  // constant, and a caller adding one header to a returned 429 must not
+  // rewrite every later response in the warm container.
+  const base = { ...jsonHeadersFor(cors) };
   return {
     statusCode,
-    headers: extraHeaders ? mergeHeadersInto({ ...base }, extraHeaders) : base,
+    headers: extraHeaders ? mergeHeadersInto(base, extraHeaders) : base,
     body: JSON.stringify({ error }),
   };
 }
@@ -281,7 +284,7 @@ export function checkResponseSize(response, headers) {
   if (cl && Number(cl) > MAX_RESPONSE_BYTES) {
     return {
       statusCode: 502,
-      headers: headers || {},
+      headers: { ...(headers || {}) },
       body: JSON.stringify({ error: 'Upstream response too large' }),
     };
   }
@@ -545,7 +548,8 @@ export async function fetchHtmlGuarded(startUrl, {
         signal: ctl.signal,
         headers,
       });
-      // Non-3xx (or a 3xx with no Location) is the final response — read it.
+      // Non-3xx is the final response — read it. (A 3xx with no Location is
+      // refused below, never read.)
       if (res.status < 300 || res.status >= 400) {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const html = await readTextCapped(res, maxBytes);
@@ -580,9 +584,15 @@ export function raceProxyHtml(target, proxies, parse, {
   timeoutMs = 7000,
   maxBytes = 4 * 1024 * 1024,
 } = {}) {
+  // One controller for the whole race: the losers are aborted the moment a
+  // winner is known, instead of each running to its own timeout and reading
+  // up to `maxBytes` of an answer nobody will use.
+  const race = new AbortController();
   const one = async (makeUrl) => {
     const ctl = new AbortController();
-    const timer = setTimeout(() => { try { ctl.abort(); } catch { /* already settled */ } }, timeoutMs);
+    const relay = () => { try { ctl.abort(); } catch { /* already settled */ } };
+    race.signal.addEventListener('abort', relay, { once: true });
+    const timer = setTimeout(relay, timeoutMs);
     try {
       const res = await fetch(makeUrl(target), {
         redirect: 'follow',
@@ -597,9 +607,12 @@ export function raceProxyHtml(target, proxies, parse, {
       return await parse(html, target);
     } finally {
       clearTimeout(timer);
+      race.signal.removeEventListener('abort', relay);
     }
   };
-  return Promise.any(proxies.map(one));
+  return Promise.any(proxies.map(one)).finally(() => {
+    try { race.abort(); } catch { /* already settled */ }
+  });
 }
 
 // ──────────────────────────── retry ─────────────────────────────
@@ -1218,16 +1231,24 @@ function anthropicHeaders(apiKey) {
 }
 
 // Tag the status (and Retry-After, if any) on the error so callers can render
-// a clean, actionable message — and NOT leak the raw upstream body.
+// a clean, actionable message — and NOT leak the raw upstream body. The body
+// rides along as `.upstreamBody` for the caller's own logging; it is kept OUT
+// of `.message` because every consumer relays that message to the browser as
+// its degraded-mode reason, and a 429/401 body carries the org id.
 function tagUpstreamError(host, res, body) {
-  const err = new Error(`${host} HTTP ${res.status}: ${String(body || '').slice(0, 200)}`);
+  const err = new Error(`${host} HTTP ${res.status}`);
   err.status = res.status;
+  err.upstreamBody = String(body || '').slice(0, 200);
   const retryAfter = res.headers && typeof res.headers.get === 'function'
     ? Number(res.headers.get('retry-after'))
     : NaN;
   if (Number.isFinite(retryAfter) && retryAfter > 0) err.retryAfter = retryAfter;
   return err;
 }
+
+// Applied when a caller passes no usable timeoutMs. Long enough for a
+// synchronous Netlify function's own 26 s ceiling to be the binding limit.
+const DEFAULT_ANTHROPIC_TIMEOUT_MS = 25_000;
 
 const isRetryableAnthropicStatus = (status) =>
   status === 429 || status === 529 || (status >= 500 && status < 600);
@@ -1267,7 +1288,11 @@ export async function callAnthropic(opts) {
   if (thinking) payload.thinking = thinking;
   if (effort) payload.output_config = { effort };
   const reqBody = JSON.stringify(payload);
-  const deadline = Date.now() + timeoutMs;
+  // An omitted or non-numeric timeoutMs used to make `deadline` NaN, which
+  // passed the `budget <= 0` guard and armed a setTimeout(NaN) — a ~1 ms abort
+  // reported as a network failure.
+  const budgetMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_ANTHROPIC_TIMEOUT_MS;
+  const deadline = Date.now() + budgetMs;
 
   // Up to two attempts: a transient 429/529/5xx (rate limit / overloaded) gets
   // one short retry while time remains, before we give up and let the caller
@@ -1309,7 +1334,14 @@ export async function callAnthropic(opts) {
   }
   if (!res) throw lastErr || new Error('model call failed');
 
-  const data = await res.json();
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    // A truncated or non-JSON 2xx body: host-tag it like every other failure
+    // instead of letting a bare SyntaxError reach the caller.
+    throw new Error(`${host} returned an unreadable response body`, { cause: e });
+  }
   return Array.isArray(data.content)
     ? data.content.filter((p) => p && p.type === 'text').map((p) => p.text).join('')
     : '';
@@ -1408,6 +1440,9 @@ export function userFacingReason(e, detail) {
   if (e && e.status === 429) {
     const wait = e.retryAfter ? `about ${e.retryAfter}s` : 'a minute';
     return `The AI service is busy right now (rate limit reached). Wait ${wait} and try again.`;
+  }
+  if (e && (e.status === 529 || (e.status >= 500 && e.status < 600))) {
+    return 'The AI service is unavailable right now. Try again in a moment.';
   }
   return detail;
 }
