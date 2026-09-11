@@ -106,17 +106,23 @@ like `2130706433` / `0x7f000001` / `0177.0.0.1` — no `localhost`/`.internal`/
 article-reader extract functions: `assertSafePublicUrl(candidate)` (both SSRF
 guards on one URL, throws or returns the normalized string),
 `fetchHtmlGuarded(startUrl, { headers, timeoutMs, maxBytes, maxRedirects })`
-(manual redirect handling with BOTH guards re-run on every hop, byte-capped
-read; never hand a URL to a library that follows redirects itself — fetch
-here, give it HTML), `raceProxyHtml(target, proxies, parse, opts)` (race
-public CORS proxies, status/size/shape-checked, first result the caller's
-`parse(html, target)` accepts wins; rejects with `AggregateError` when all
-fail).
+(manual redirect handling with BOTH guards re-run on every hop **and on
+`startUrl` itself** since 0.10.0 — the guard is idempotent, so a caller that
+already checked pays one cached lookup rather than owning the contract;
+byte-capped read; never hand a URL to a library that follows redirects itself
+— fetch here, give it HTML), `raceProxyHtml(target, proxies, parse, opts)`
+(race public CORS proxies, status/size/shape-checked, first result the
+caller's `parse(html, target)` accepts wins; rejects with `AggregateError`
+when all fail). Since 0.10.0 `raceProxyHtml` also runs the string-level guard
+on `target` before building any proxy URL — it is a caller-supplied URL going
+to a third party's egress — and refuses with a rejected promise.
 
 **Retry** — `fetchWithRetry(url, init, opts)` (exp backoff + full jitter;
 retries network errors + 502/503/504, 429 only with `retryOn429`; a
 `Retry-After` header on a retryable response sets the delay — capped at
-`opts.capMs`, never negative, jittered backoff when absent/unparseable;
+`opts.capMs`, never negative, jittered backoff when absent/unparseable (a
+value with no letter in it is never read as an HTTP-date, so `1.5` and `-5`
+can't parse as past dates and collapse the backoff to zero);
 injectable `fetchFn`/`sleepFn`/`rng`), `RETRYABLE_STATUSES`.
 - `opts.retries: 0` performs **exactly one attempt** (no backoff machinery),
   and `opts.attemptTimeoutMs` gives **each attempt its own AbortSignal
@@ -154,12 +160,24 @@ distributed limiter) and no-op on failure (a null store reads as a miss).
   without expiry.
 - `blobKey(...parts)` → stable `|`-joined key (nullish parts blank).
 
-**Handler** — `createHandler({ name, rateLimit, distributed, cors, handle,
-onError })`. `cors: false` (default `true`) makes every response the wrapper
-itself emits CORS-free: the OPTIONS short-circuit becomes a bare 204, and the
-limiter's 429/414 plus the catch-all 500 use the no-CORS shapes — pair it with
-`createResponders({ cors: false })` inside `handle` for a fully CORS-free
-endpoint.
+**Handler** — `createHandler({ name, methods, maxBodyBytes, rateLimit,
+distributed, cors, handle, onError })`.
+
+- `methods` (0.10.0, optional) — array of allowed HTTP methods, e.g.
+  `['GET', 'HEAD']`, matched case-insensitively. Anything else is refused with
+  a 405 carrying an `Allow` header listing exactly these methods, **before**
+  the limiter runs, so a rejected verb never spends a caller's rate-limit
+  budget. The OPTIONS short-circuit is unchanged and still answers preflights
+  whether or not OPTIONS is in the list. Omitted → no restriction.
+- `maxBodyBytes` (0.10.0, optional) — cap on the request body. A larger
+  `event.body` is refused with a 413 before `handle` runs, so a handler never
+  parses an unbounded string; a base64-transported body is measured **decoded**
+  (its string form is ~4/3 the payload). Omitted → uncapped.
+- `cors: false` (default `true`) makes every response the wrapper itself emits
+  CORS-free: the OPTIONS short-circuit becomes a bare 204, and the 405, the
+  413, the limiter's 429/414 plus the catch-all 500 use the no-CORS shapes —
+  pair it with `createResponders({ cors: false })` inside `handle` for a fully
+  CORS-free endpoint.
 
 **Anthropic (Claude) client** — hardened Messages-API call machinery,
 consolidated from Surf-Tracker's non-streaming client (`lib/anthropic.js`) and
@@ -174,7 +192,10 @@ api key or the raw upstream body, and `.status`/`.retryAfter` tagging.
   baseUrl?, thinking?, effort?, fetchImpl? }`.
 - `openAnthropicStream(opts)` (async) → the ok `Response` (readable `.body`
   SSE). The retry only re-issues the initial POST — never mid-stream. Bound
-  the whole request with `opts.signal` (e.g. `AbortSignal.timeout(...)`).
+  the whole request with `opts.signal` (e.g. `AbortSignal.timeout(...)`);
+  since 0.10.0 an omitted signal defaults to `AbortSignal.timeout(25_000)`,
+  the same ceiling `callAnthropic` applies to its own budget, so a stalled
+  SSE can no longer run to the platform's invocation limit.
 - `parseModelJson(text)` — first balanced JSON object out of prose/fences.
 - `toBullets(v, maxChars)` — normalize a model value into capped bullets.
 - `userFacingReason(e, detail)` — honest 429 "busy, wait Ns" message from the

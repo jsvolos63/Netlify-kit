@@ -388,6 +388,27 @@ test('parseSafeHttpsUrl: trailing-dot hosts and non-dotted-decimal IP encodings 
   assert.ok(parseSafeHttpsUrl('https://example.com./').ok);
 });
 
+// Short-form IPv4 (127.1, 10.0.1, 172.16.1) is a classic way past a guard that
+// only pattern-matches dotted-quad strings. It never reaches this kit's own
+// heuristics: the WHATWG URL parser normalizes every numeric host form it
+// accepts to dotted-decimal (127.1 -> 127.0.0.1) and refuses the rest
+// (foo.123 -> invalid-url), so both doors are already shut. Pinned here
+// because that is a property of the URL parser, not of code in this file —
+// nothing in index.js would fail if it changed.
+test('parseSafeHttpsUrl: short-form IPv4 hosts are refused; numeric-LOOKING names still pass', () => {
+  for (const host of ['127.1', '10.0.1', '172.16.1']) {
+    const r = parseSafeHttpsUrl(`https://${host}/x`);
+    assert.equal(r.ok, false, `${host} must be refused`);
+    assert.equal(r.error, 'disallowed-host');
+  }
+  // A hostname whose last label is not a number is a hostname, digits or not.
+  for (const host of ['example.com', 'a1.example.net', '1password.com']) {
+    assert.equal(parseSafeHttpsUrl(`https://${host}/x`).ok, true, `${host} must pass`);
+  }
+  // ...and a name the parser can't read as IPv4 is refused earlier still.
+  assert.equal(parseSafeHttpsUrl('https://foo.123/x').error, 'invalid-url');
+});
+
 test('private IP helpers', () => {
   for (const ip of ['10.0.0.1', '127.0.0.1', '169.254.169.254', '192.168.1.1', '172.16.5.5', '100.64.0.1'])
     assert.ok(isPrivateIPv4(ip), ip);
@@ -473,6 +494,21 @@ test('fetchWithRetry: absent or unparseable Retry-After falls back to jittered b
   const fetchFn = async () => (n++ === 0 ? { status: 503, body: { cancel: async () => {} } } : { status: 200 });
   await fetchWithRetry('u', {}, { fetchFn, sleepFn: async (ms) => { sleeps.push(ms); }, ...jitterOpts });
   assert.deepEqual(sleeps, [100]);
+});
+
+test('fetchWithRetry: a non-integer or negative Retry-After is NOT an HTTP-date', async () => {
+  // rng 0.5, baseMs 200 -> the jittered fallback is exactly 100ms, which is
+  // what a value this function refuses to parse must produce.
+  const jitterOpts = { rng: () => 0.5, baseMs: 200 };
+  // Date.parse('1.5') is Jan 5 2001 and Date.parse('-5') is May 1 2001 in V8 —
+  // both in the PAST, so a lenient parse yields a negative delay clamped to 0:
+  // every retry fires instantly, which is the storm Retry-After exists to stop.
+  assert.deepEqual(await sleepsFor('1.5', jitterOpts), [100], '"1.5" must fall back to backoff, not 0');
+  assert.deepEqual(await sleepsFor('-5', jitterOpts), [100], '"-5" must fall back to backoff, not 0');
+  // The two forms RFC 9110 does define are untouched by the guard.
+  assert.deepEqual(await sleepsFor('1', jitterOpts), [1000], 'delta-seconds still wins');
+  const [dated] = await sleepsFor(new Date(Date.now() + 1500).toUTCString(), jitterOpts);
+  assert.ok(dated > 0 && dated <= 1500, `HTTP-date still wins, got ${dated}`);
 });
 
 test('fetchWithRetry: Retry-After honored on 429 too when retryOn429 is set', async () => {
@@ -821,6 +857,87 @@ test('createHandler: preflight, happy path, rate limit, error → 500, onError',
   assert.throws(() => createHandler({}), /handle option is required/);
 });
 
+test('createHandler({ methods }): refuses other verbs with 405 + Allow, before the limiter', async () => {
+  _resetRateLimit();
+  let handled = 0;
+  const h = createHandler({
+    methods: ['get', 'head'],            // case-insensitive on the way in
+    rateLimit: { max: 1, windowMs: 60_000 },
+    handle: async () => { handled++; return ok({}); },
+  });
+  const from = (method) => eventWith({ method, headers: { 'x-forwarded-for': '9.9.9.9' } });
+
+  const bad = await h(from('POST'));
+  assert.equal(bad.statusCode, 405);
+  assert.equal(bad.headers.Allow, 'GET, HEAD');
+  assert.deepEqual(JSON.parse(bad.body), { error: 'Method not allowed.' });
+  assert.equal(bad.headers['Access-Control-Allow-Origin'], '*', 'CORS by default, like every other wrapper response');
+  assert.equal(handled, 0, 'handle never ran');
+
+  // The refusal happened BEFORE the limiter, so the single allowed hit is
+  // still available — a rejected verb must not spend the caller's budget.
+  assert.equal((await h(from('GET'))).statusCode, 200);
+  assert.equal((await h(from('GET'))).statusCode, 429);
+  assert.equal(handled, 1);
+
+  // OPTIONS is unchanged: the preflight short-circuit runs first, whether or
+  // not OPTIONS appears in `methods`.
+  assert.equal((await h(from('OPTIONS'))).statusCode, 204);
+
+  // Omitted (the default) restricts nothing — every existing consumer's shape.
+  const open = createHandler({ rateLimit: null, handle: async () => ok({}) });
+  assert.equal((await open(eventWith({ method: 'DELETE' }))).statusCode, 200);
+});
+
+test('createHandler({ maxBodyBytes }): 413 before handle; base64 bodies measured decoded', async () => {
+  let handled = 0;
+  const h = createHandler({
+    maxBodyBytes: 10,
+    rateLimit: null,
+    handle: async () => { handled++; return ok({}); },
+  });
+  const ev = (body, isBase64Encoded = false) => ({ httpMethod: 'POST', headers: {}, body, isBase64Encoded });
+
+  assert.equal((await h(ev('x'.repeat(10)))).statusCode, 200, 'exactly at the cap is allowed');
+  const over = await h(ev('x'.repeat(11)));
+  assert.equal(over.statusCode, 413);
+  assert.deepEqual(JSON.parse(over.body), { error: 'Request body too large.' });
+  assert.equal(handled, 1, 'handle never ran for the oversized body');
+
+  // A body with no body at all, and a multibyte body measured in BYTES not
+  // characters: 4 'é' are 8 bytes, 6 are 12.
+  assert.equal((await h(ev(null))).statusCode, 200);
+  assert.equal((await h(ev('é'.repeat(4)))).statusCode, 200);
+  assert.equal((await h(ev('é'.repeat(6)))).statusCode, 413);
+
+  // Base64 transport: 16 base64 chars decode to 12 bytes (over), 12 chars to
+  // 9 (under). Measuring the STRING would reject both.
+  assert.equal((await h(ev(Buffer.alloc(12).toString('base64'), true))).statusCode, 413);
+  assert.equal((await h(ev(Buffer.alloc(9).toString('base64'), true))).statusCode, 200);
+
+  // Omitted (the default) caps nothing.
+  const uncapped = createHandler({ rateLimit: null, handle: async () => ok({}) });
+  assert.equal((await uncapped(ev('x'.repeat(10_000)))).statusCode, 200);
+});
+
+test('createHandler({ cors: false }): the 405 and 413 are CORS-free too', async () => {
+  const hasCors = (r) => Object.keys(r.headers).some((k) => /^access-control-/i.test(k));
+  const h = createHandler({
+    cors: false,
+    methods: ['GET'],
+    maxBodyBytes: 4,
+    rateLimit: null,
+    handle: async () => ({ statusCode: 200, headers: {}, body: '{}' }),
+  });
+  const m = await h({ httpMethod: 'POST', headers: {} });
+  assert.equal(m.statusCode, 405);
+  assert.equal(m.headers.Allow, 'GET');
+  assert.ok(!hasCors(m), '405 must carry no CORS headers under cors:false');
+  const b = await h({ httpMethod: 'GET', headers: {}, body: 'toolong' });
+  assert.equal(b.statusCode, 413);
+  assert.ok(!hasCors(b), '413 must carry no CORS headers under cors:false');
+});
+
 test('createHandler({ cors: false }): preflight, 429, and 500 all emit zero CORS headers', async () => {
   _resetRateLimit();
   const responders = createResponders({ cors: false });
@@ -1125,6 +1242,33 @@ test('openAnthropicStream: an abort is terminal — no retry', async () => {
   assert.equal(attempts, 1);
 });
 
+test('openAnthropicStream: an omitted signal gets callAnthropic\'s 25s deadline', async () => {
+  // The only entry point here with no deadline of its own: an upstream that
+  // accepted the POST and then stalled mid-SSE hung until the platform killed
+  // the invocation. Spy on AbortSignal.timeout rather than waiting 25s.
+  const savedTimeout = AbortSignal.timeout;
+  const asked = [];
+  AbortSignal.timeout = (ms) => { asked.push(ms); return savedTimeout.call(AbortSignal, ms); };
+  try {
+    let seen;
+    const fetchImpl = async (url, init) => { seen = init.signal; return fakeAnthropicResponse({ withBody: true }); };
+    await openAnthropicStream({ apiKey: 'k', model: 'm', messages: [], maxTokens: 10, fetchImpl });
+    assert.deepEqual(asked, [25_000], 'same ceiling callAnthropic defaults to');
+    assert.ok(seen instanceof AbortSignal);
+    assert.equal(seen.aborted, false);
+
+    // A caller-supplied signal is still passed through untouched, and no
+    // timeout is minted behind it.
+    asked.length = 0;
+    const mine = new AbortController().signal;
+    await openAnthropicStream({ apiKey: 'k', model: 'm', messages: [], maxTokens: 10, signal: mine, fetchImpl });
+    assert.equal(seen, mine);
+    assert.deepEqual(asked, []);
+  } finally {
+    AbortSignal.timeout = savedTimeout;
+  }
+});
+
 test('openAnthropicStream: tags status + retryAfter for the caller', async () => {
   const fetchImpl = async () =>
     fakeAnthropicResponse({ ok: false, status: 429, headers: { 'Retry-After': '30' }, textBody: 'rate' });
@@ -1244,9 +1388,11 @@ test('rateLimit: well-formed IPv6 addresses still get their own buckets', () => 
 // ─────────────── guarded article fetch (0.9.0) ───────────────
 //
 // fetchHtmlGuarded / raceProxyHtml drive the real global fetch, so these
-// tests stub globalThis.fetch and restore it. None of them touch DNS: the
-// redirect-cap check runs BEFORE the per-hop guard, and unsafe-hop cases use
-// URLs the string-level guard rejects without a lookup.
+// tests stub globalThis.fetch and restore it. Every REFUSAL case is decided by
+// the string-level guard, so it costs no lookup; the happy paths do resolve
+// example.com, because fetchHtmlGuarded now validates its start URL the same
+// way it validates a redirect hop (0.10.0) and that half of the guard is a
+// real DNS query.
 
 const savedFetch = globalThis.fetch;
 function withFetch(fn, run) {
@@ -1277,6 +1423,45 @@ test('assertSafePublicUrl: rejects without DNS on string-level failures', async 
   await assert.rejects(() => assertSafePublicUrl('http://example.com/a'), /unsafe redirect target/);
   await assert.rejects(() => assertSafePublicUrl('https://localhost/a'), /unsafe redirect target/);
   await assert.rejects(() => assertSafePublicUrl('https://169.254.169.254/latest'), /unsafe redirect target/);
+});
+
+test('fetchHtmlGuarded: an unsafe START url is refused before any fetch', async () => {
+  // The start URL used to be the caller's to vet — which made the one URL an
+  // attacker actually supplies the only one this function took on trust. All
+  // three of these fail the STRING-level guard, so no DNS and no fetch.
+  let calls = 0;
+  await withFetch(async () => { calls++; return htmlRes(200, '<html>x</html>'); }, async () => {
+    for (const bad of [
+      'https://169.254.169.254/latest/meta-data/',  // cloud metadata, IP literal
+      'https://127.0.0.1/admin',
+      'https://localhost/admin',
+      'http://example.com/story',                   // not https
+      'https://user:pw@example.com/story',          // credentials
+      'not a url',
+    ]) {
+      await assert.rejects(() => fetchHtmlGuarded(bad), /unsafe redirect target/, bad);
+    }
+  });
+  assert.equal(calls, 0, 'nothing may be fetched for a refused start url');
+});
+
+test('raceProxyHtml: an unsafe target is refused before it reaches a proxy', async () => {
+  // The target is handed to a THIRD PARTY's egress, so it must clear the
+  // string-level guard first — otherwise an internal hostname or a non-https
+  // target went straight into someone else's fetch.
+  let built = 0;
+  const proxies = [(u) => { built++; return `https://proxy.example/?u=${encodeURIComponent(u)}`; }];
+  for (const bad of ['http://pub.example/story', 'https://localhost/x', 'https://169.254.169.254/x', 'file:///etc/passwd']) {
+    await assert.rejects(
+      () => raceProxyHtml(bad, proxies, async () => ({ ok: true })),
+      /unsafe proxy target/,
+      bad,
+    );
+  }
+  assert.equal(built, 0, 'no proxy url may even be built');
+  // A REJECTED PROMISE, not a synchronous throw: a .catch()-style caller must
+  // still see it.
+  assert.doesNotThrow(() => { raceProxyHtml('http://pub.example/x', proxies, async () => ({})).catch(() => {}); });
 });
 
 test('fetchHtmlGuarded: returns the final page html and url', async () => {

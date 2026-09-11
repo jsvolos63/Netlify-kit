@@ -526,10 +526,13 @@ export async function assertSafePublicUrl(candidate) {
 }
 
 /** Direct server-side fetch of a page's HTML with MANUAL redirect handling,
- *  re-validating every hop through assertSafePublicUrl. `startUrl` must
- *  already be validated by the caller (this function guards the hops it
- *  discovers, not the URL it was handed). Resolves `{ html, finalUrl }`;
- *  throws on non-ok status, redirect loops, oversized bodies, or an unsafe
+ *  re-validating EVERY hop — including `startUrl` — through
+ *  assertSafePublicUrl. The start URL used to be the caller's to vet, which
+ *  made the one URL an attacker actually supplies the only one this function
+ *  took on trust; the guard is idempotent, so a caller that already checked
+ *  pays one cached DNS lookup rather than carrying the whole contract.
+ *  Resolves `{ html, finalUrl }`; throws BEFORE any fetch on an unsafe start
+ *  URL, and on non-ok status, redirect loops, oversized bodies, or an unsafe
  *  hop. Never hand the URL to a library that follows redirects itself —
  *  fetch the bytes here and give the library HTML. */
 export async function fetchHtmlGuarded(startUrl, {
@@ -538,10 +541,12 @@ export async function fetchHtmlGuarded(startUrl, {
   maxBytes = 4 * 1024 * 1024,
   maxRedirects = 5,
 } = {}) {
+  // Before the controller/timer: a refused start URL must cost no fetch and
+  // leave no timer behind.
+  let currentUrl = await assertSafePublicUrl(startUrl);
   const ctl = new AbortController();
   const timer = setTimeout(() => { try { ctl.abort(); } catch { /* already settled */ } }, timeoutMs);
   try {
-    let currentUrl = startUrl;
     for (let hops = 0; ; hops++) {
       const res = await fetch(currentUrl, {
         redirect: 'manual',
@@ -575,15 +580,26 @@ export async function fetchHtmlGuarded(startUrl, {
  *  HTML shape before `parse` runs, so a proxy's JSON error page or
  *  rate-limit notice skips to the next contender. Rejects with the
  *  AggregateError from Promise.any only when every proxy failed.
- *  SSRF note: the proxies fetch from THEIR OWN egress, so hop validation
- *  doesn't apply here — what this function guards is the response size and
- *  shape. Callers choose their proxy list deliberately; routing content
- *  through third parties is a per-app decision. */
+ *  SSRF note: the proxies fetch from THEIR OWN egress, so the resolved-IP
+ *  hop validation doesn't apply here — but `target` is still a caller-supplied
+ *  URL being handed to a third party, so it must clear the STRING-level guard
+ *  (https, no credentials, no IP literal, no internal suffix) first. Without
+ *  it a `file:`/`http:` target, or an internal hostname, went straight into a
+ *  proxy URL for someone else's egress to fetch and hand back. What this
+ *  function guards beyond that is the response size and shape. Callers choose
+ *  their proxy list deliberately; routing content through third parties is a
+ *  per-app decision.
+ *  Refusal is a REJECTED PROMISE, not a synchronous throw: this function
+ *  returns a promise on every other path, and a `.catch()`-style caller would
+ *  never see a throw that happened before the chain was built. */
 export function raceProxyHtml(target, proxies, parse, {
   headers,
   timeoutMs = 7000,
   maxBytes = 4 * 1024 * 1024,
 } = {}) {
+  if (!isSafeHttpsUrl(target)) {
+    return Promise.reject(new Error('unsafe proxy target'));
+  }
   // One controller for the whole race: the losers are aborted the moment a
   // winner is known, instead of each running to its own timeout and reading
   // up to `maxBytes` of an answer nobody will use.
@@ -657,6 +673,12 @@ function _retryAfterMs(res) {
   if (!raw) return null;
   const s = String(raw).trim();
   if (/^\d+$/.test(s)) return Number(s) * 1000;
+  // Every HTTP-date form names a month, so a value with no letter in it is
+  // not one. V8's Date.parse is lenient enough to read "1.5" and "-5" as
+  // dates in 2001 — i.e. dates in the PAST, i.e. a negative delay clamped to
+  // zero backoff, which is the retry storm this header exists to prevent.
+  // Same guard as @jfs/fetch-kit's parseRetryAfter, for the same reason.
+  if (!/[A-Za-z]/.test(s)) return null;
   const t = Date.parse(s);
   return Number.isNaN(t) ? null : t - Date.now();
 }
@@ -1109,22 +1131,49 @@ export async function setTTLCached(store, key, data, { now = Date.now() } = {}) 
 // Wraps the cross-cutting concerns every function needs — CORS preflight,
 // per-IP rate limiting, top-level try/catch + 500 fallback.
 
+/** Measure `event.body` in BYTES, decoding first when the platform
+ *  base64-transported it — a binary upload's base64 string is ~4/3 the size of
+ *  the payload the handler will actually see, so measuring the string would
+ *  reject uploads a third under the caller's stated cap. */
+function _bodyByteLength(event) {
+  const body = event && event.body;
+  if (body == null || body === '') return 0;
+  if (typeof body !== 'string') return typeof body.byteLength === 'number' ? body.byteLength : 0;
+  return Buffer.byteLength(body, event.isBase64Encoded ? 'base64' : 'utf8');
+}
+
 /** Build a Netlify function handler. Options:
  *   - `name`        — identifier used in the default error log.
+ *   - `methods`     — optional array of allowed HTTP methods, e.g.
+ *                     `['GET', 'HEAD']` (case-insensitive). Anything else is
+ *                     refused with a 405 carrying an `Allow` header listing
+ *                     exactly these methods, BEFORE the limiter runs — a
+ *                     rejected verb should not spend a caller's rate-limit
+ *                     budget. Omitted (the default) → no method restriction,
+ *                     which is what every existing consumer gets. The OPTIONS
+ *                     short-circuit above is unchanged and still answers
+ *                     preflights whether or not OPTIONS is in this list.
+ *   - `maxBodyBytes`— optional cap on the request body. A larger `event.body`
+ *                     is refused with a 413 before `handle` runs, so a handler
+ *                     never JSON.parses an unbounded string. Base64-transported
+ *                     bodies are measured decoded. Omitted → uncapped.
  *   - `rateLimit`   — `{ max, windowMs }` (default 60 / 60 s); `null`/`false`
  *                     disables the limiter.
  *   - `distributed` — when true, uses the Blobs-backed limiter.
  *   - `cors`        — default true. `false` → NONE of the responses this
  *                     wrapper itself emits carry Access-Control-* headers:
- *                     the OPTIONS short-circuit becomes a bare 204, the
- *                     limiter's 429/414 and the catch-all 500 use the no-CORS
- *                     shapes (pair with `createResponders({ cors: false })`
- *                     inside `handle` for a fully CORS-free endpoint).
+ *                     the OPTIONS short-circuit becomes a bare 204, the 405,
+ *                     the 413, the limiter's 429/414 and the catch-all 500 use
+ *                     the no-CORS shapes (pair with
+ *                     `createResponders({ cors: false })` inside `handle` for a
+ *                     fully CORS-free endpoint).
  *   - `handle`      — `async (event) => responseObject`. Required.
  *   - `onError`     — `async (error, event) => responseObject`. Optional. */
 export function createHandler(options) {
   const {
     name = 'handler',
+    methods,
+    maxBodyBytes,
     rateLimit: rateLimitOpt = { max: 60, windowMs: 60_000 },
     distributed = false,
     cors = true,
@@ -1135,6 +1184,13 @@ export function createHandler(options) {
   if (typeof handle !== 'function') {
     throw new Error('createHandler: handle option is required');
   }
+
+  // Normalized once at build time, not per request.
+  const allowed = Array.isArray(methods) && methods.length
+    ? methods.map((m) => String(m).toUpperCase())
+    : null;
+  const allowHeader = allowed ? allowed.join(', ') : null;
+  const bodyCap = Number.isFinite(maxBodyBytes) && maxBodyBytes >= 0 ? maxBodyBytes : null;
 
   const limiterEnabled = rateLimitOpt !== null && rateLimitOpt !== false;
   const limit = limiterEnabled
@@ -1149,9 +1205,20 @@ export function createHandler(options) {
       : (event && event.httpMethod === 'OPTIONS' ? { statusCode: 204, headers: {}, body: '' } : null);
     if (preflight) return preflight;
 
+    if (allowed) {
+      const method = String((event && event.httpMethod) || '').toUpperCase();
+      if (!allowed.includes(method)) {
+        return _errorResponse(405, 'Method not allowed.', { Allow: allowHeader }, cors);
+      }
+    }
+
     if (limit) {
       const limited = await limit(event);
       if (limited) return limited;
+    }
+
+    if (bodyCap !== null && _bodyByteLength(event) > bodyCap) {
+      return _errorResponse(413, 'Request body too large.', undefined, cors);
     }
 
     try {
@@ -1354,14 +1421,19 @@ export async function callAnthropic(opts) {
  *
  * The retry only ever re-issues the initial POST. Once the upstream returns
  * 2xx with a readable body we hand that Response back and the caller consumes
- * the SSE — we never retry mid-stream. Bound the whole request (headers +
- * stream) by passing an AbortSignal (e.g. AbortSignal.timeout(...)).
+ * the SSE — we never retry mid-stream. The whole request (headers + stream) is
+ * bounded by `signal`; omit it and it defaults to
+ * AbortSignal.timeout(DEFAULT_ANTHROPIC_TIMEOUT_MS), the same ceiling
+ * callAnthropic applies to its own budget. Without a default an upstream that
+ * accepted the POST and then stalled mid-SSE hung until the platform killed
+ * the invocation — the one entry point here with no deadline of its own.
  *
  * opts: { apiKey, model, system, messages, maxTokens, effort, thinking,
  *         signal, baseUrl, fetchImpl }
  */
 export async function openAnthropicStream(opts) {
-  const { apiKey, model, system, messages, maxTokens, effort, thinking, signal } = opts;
+  const { apiKey, model, system, messages, maxTokens, effort, thinking } = opts;
+  const signal = opts.signal || AbortSignal.timeout(DEFAULT_ANTHROPIC_TIMEOUT_MS);
   const fetchImpl = opts.fetchImpl || globalThis.fetch;
   const { base, host } = anthropicBase(opts);
 
