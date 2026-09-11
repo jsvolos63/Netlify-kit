@@ -1,8 +1,10 @@
 # @jfs/netlify-kit — working notes for Claude
 
 Shared, dependency-free Netlify Functions primitives (CORS + preflight,
-JSON/text/error responses, capped body reads, input validation, SSRF
-guards, the guarded article fetch behind the family's reader extract
+JSON/text/error responses, capped body reads — the response half is
+`readTextCapped`, the REQUEST half is `createHandler`'s `maxBodyBytes`, which
+the description claimed for a release before it existed — input validation,
+SSRF guards, the guarded article fetch behind the family's reader extract
 functions — per-hop-revalidated redirects + the CORS-proxy race —
 retry-with-backoff fetch, per-IP rate limiting, a Blobs store
 opener + short-TTL cache, a `createHandler` boundary, and a hardened
@@ -10,6 +12,52 @@ Anthropic Messages-API client) extracted from the JFS family of buildless
 static sites. Consumers vendor this kit via its own CLI rather than
 installing it at runtime, so a change here reaches an app only once that
 app bumps its pin and re-runs `vendor:sync`.
+
+## The guards that hold 0.10.0's hardening
+
+Four of these landed because a reviewer walked the file, not because anything
+broke in production — which is the only time to make them, since a consumer
+picks them up on a pin bump and can't see the diff.
+
+- **`fetchHtmlGuarded` validates its own `startUrl`.** It used to guard only
+  the hops it DISCOVERED, documenting the start URL as the caller's job — so
+  the one URL an attacker actually supplies was the only one the function took
+  on trust, and a consumer that forgot had no guard at all. `assertSafePublicUrl`
+  is idempotent, so a caller that already checked pays one cached DNS lookup.
+  The call sits BEFORE the AbortController, so a refusal leaves no timer behind.
+- **`raceProxyHtml` string-guards its `target`.** The proxies fetch from their
+  own egress, which is why the resolved-IP half doesn't apply — but a
+  caller-supplied `file:`/`http:`/internal-host target still went straight into
+  a third party's fetch. Refusal is a REJECTED PROMISE, never a synchronous
+  throw: every other path returns a promise, and a `.catch()`-style caller
+  would never see a throw that happened before the chain was built.
+  **This is what makes `isSafeHttpsUrl` load-bearing** — it had zero consumers
+  family-wide and read like a retirement candidate. It is an internal caller
+  now; leave it exported.
+- **`Retry-After` needs a letter before it can be a date.** `Date.parse` in V8
+  reads `1.5` as Jan 2001 and `-5` as May 2001 — both PAST, so the delay
+  clamps to 0 and every retry fires at once, which is the storm the header
+  exists to prevent. Same guard, same reason, as @jfs/fetch-kit's
+  `parseRetryAfter`; the two twins should keep agreeing.
+- **`openAnthropicStream` defaults its signal** to
+  `AbortSignal.timeout(DEFAULT_ANTHROPIC_TIMEOUT_MS)` — the ceiling
+  `callAnthropic` already applied to itself. It was the one entry point with no
+  deadline of its own, so an upstream that accepted the POST and then stalled
+  mid-SSE ran to the platform's invocation limit.
+- **`createHandler` gained `methods` and `maxBodyBytes`**, both optional and
+  both undefined by default, so every existing consumer's behaviour is
+  byte-identical. Two orderings are deliberate: the 405 runs BEFORE the limiter
+  (a rejected verb must not spend a caller's rate-limit budget) and the 413
+  runs AFTER it (a flood of oversized bodies should still be rate-limited). A
+  base64-transported body is measured DECODED — its string form is ~4/3 the
+  payload, so measuring the string rejects uploads a third under the cap.
+
+Not done, and worth not "fixing" later: `looksLikeNumericIp`'s short-form IPv4
+hole (`127.1`, `10.0.1`) is not reachable. `parseSafeHttpsUrl` runs `new URL()`
+first, and the WHATWG parser normalizes every numeric host form it accepts to
+dotted-decimal (`127.1` → `127.0.0.1`, caught by the dotted-quad regex) and
+refuses the rest (`foo.123` → `invalid-url`). A test pins that behaviour,
+since it belongs to the URL parser rather than to anything in this file.
 
 ## Lint
 
