@@ -3,8 +3,9 @@
 This kit ships no site, runs no deploy and calls no upstream on its own. Everything
 it produces reaches the world as a generated copy inside eight other repos' function
 directories, so maintenance here turns on three things a green suite says nothing
-about: whether the weekly pin bump is landing (it is not — five scheduled runs, five
-failures, never once green), whether the consumers have actually re-vendored the code
+about: whether the weekly pin bump is landing (it is not — six runs, six failures,
+never once green; the pin is current only because a session opened the bump's PR by
+hand on 2026-09-22), whether the consumers have actually re-vendored the code
 that was tagged, and whether the figures this file pins on somebody else's behalf — a
 model id, an API version header, a timeout sized against a platform ceiling — are
 still true.
@@ -13,24 +14,27 @@ still true.
 
 | Automation | Fires | Lands by itself | Leaves for a session | How a failure would be noticed |
 | --- | --- | --- | --- | --- |
-| `.github/workflows/test.yml` → the family's `family-ci.yml@main` (`verify-kit-pins: true`, `maintenance-check: true`, `version-guard-paths: index.js bin`, `run:` the three gate commands below) | `push` to `main`, every `pull_request`, `workflow_dispatch` | — it *is* the gate | nothing | red on the PR or the commit. The one automation here whose failure appears where somebody is already looking. |
+| `.github/workflows/test.yml` → the family's `family-ci.yml@main` (`verify-kit-pins: true`, `install-command: npm ci`, `prod-audit: true`, `maintenance-check: true`, `version-guard-paths: index.js bin`, `run:` the three gate commands below) | `push` to `main`, every `pull_request`, `workflow_dispatch` | — it *is* the gate | nothing | red on the PR or the commit. The one automation here whose failure appears where somebody is already looking. |
 | `.github/workflows/kit-pin-bump.yml` (`41 6 * * 1` — Mondays 06:41 UTC, which GitHub's scheduler runs a few minutes late) + dispatch | weekly | *intended*: the one `@jfs` pin, `npm install` so the lockfile follows, the CLAUDE.md conventions block, the PR, the squash-merge | *today*: all of it | **nothing, and it has never succeeded.** See below. |
-| `.github/workflows/release.yml` (`workflow_run` on `Test` completed, `branches: [main]`) + dispatch | CI green on `main` | the `v<version>` tag and its GitHub release | nothing | **nothing** — but it demonstrably works here: 33 runs, and `v0.10.0` points at `f4d2347`, which is `main`. |
-| `.github/workflows/dependabot-merge.yml` (`workflow_run` on `Test` completed) + `.github/dependabot.yml` (npm weekly Tuesday, minor+patch grouped, limit 5; `github-actions` monthly) | on each CI completion | every minor/patch bump, squash-merged on green — it landed #37 on 2026-09-08 | **every major**, and any PR body it cannot parse | a PR sits open. Nobody is told. |
+| `.github/workflows/release.yml` (`workflow_run` on `Test` completed, `branches: [main]`) + dispatch | CI green on `main` | the `v<version>` tag and its GitHub release | nothing | **nothing** — but it demonstrably works here: 35 runs by 2026-09-22, and `v0.10.0` points at `f4d2347`, the commit that set the version (later commits on `main` left it at 0.10.0, so each re-run was a correct no-op). |
+| `.github/workflows/dependabot-merge.yml` (`workflow_run` on `Test` completed) + `.github/dependabot.yml` (npm weekly Tuesday, minor+patch grouped, limit 5; `github-actions` monthly) | on each CI completion | every minor/patch bump, squash-merged on green — it landed #37 on 2026-09-08 and #41 on 2026-09-22 | **every major**, and any PR body it cannot parse | a PR sits open. Nobody is told. |
 
 There is nothing else: no deploy, no smoke test, no cron but the bump, and no monitor
 in this repository. The only thing that will ever notice the bump failing is the
 family liveness check in vendor-cli — scheduled Mondays 08:10 UTC, deliberately ~90
 minutes after the bump so it observes that week's run, opening one rolling issue in
-the hub rather than a notification in thirteen repos. It is **not on vendor-cli's
-`main` yet**: it lands in the same change as this file, and until it does, a failed
-scheduled run here is seen by nobody.
+the hub rather than a notification in thirteen repos. It is on vendor-cli's `main`
+(#58), and it is **not watching yet**: its first run, dispatched 2026-09-22, exited 2
+("could not check") because the `FAMILY_READ_TOKEN` secret it needs does not exist,
+and opened vendor-cli #60 saying so. Only the owner can create that PAT. Until then a
+failed scheduled run here is still seen by nobody.
 
-### The weekly bump has never landed, and the work is sitting on a branch
+### The weekly bump has never landed by itself
 
 Verified 2026-09-22 against this repo's own Actions history. `kit-pin-bump.yml` has
-**five** runs — 2026-08-24, 08-31, 09-07, 09-14, 09-21, every one `schedule`, every
-one `failure`. Two unrelated causes:
+**six** runs — five `schedule` (2026-08-24, 08-31, 09-07, 09-14, 09-21) and one
+`workflow_dispatch` (2026-09-22 21:53 UTC) — and every one is a `failure`. Two
+unrelated causes:
 
 - **Runs 1–3** died on `npm error Missing script: "vendor:sync"` — read from run 3's
   log — at the *Re-vendor from the bumped pins* step, having already resolved the pin
@@ -38,21 +42,21 @@ one `failure`. Two unrelated causes:
   the reusable workflow's defaults ran `npm run vendor:sync` and
   `npm run version:stamp`, which a kit does not have. Fixed by #35 on 2026-09-08
   (`vendor-sync-command: npm install`, `version-bump-command: ''`).
-- **Runs 4–5** get all the way through. Run 5's job did steps 1–10 green — including
-  *Run the repo's CI checks against the bumped tree* — and then failed on step 11,
-  *Open a pull request if anything changed*, with
-  `GitHub Actions is not permitted to create or approve pull requests.` Step 12, the
-  merge, was skipped. That is a **per-repo setting**, not a code bug: *Settings →
-  Actions → General → Workflow permissions*, the "Allow GitHub Actions to create and
-  approve pull requests" box. The same failure is live in pwa-kit and fetch-kit and
-  nowhere else in the family.
+- **Runs 4–6** get all the way through — resolve, re-install, run the check command
+  against the bumped tree, push `auto/kit-pin-bump` — and fail at *Open a pull request
+  if anything changed*, with
+  `GitHub Actions is not permitted to create or approve pull requests.` The merge step
+  is skipped. That is a **per-repo setting**, not a code bug: *Settings → Actions →
+  General → Workflow permissions*, the "Allow GitHub Actions to create and approve
+  pull requests" box. Run 6 was dispatched to check whether it had been flipped, and
+  failed the same way; the same failure is live in pwa-kit and fetch-kit and nowhere
+  else in the family.
 
-So correct, validated work exists and was delivered nowhere. It is on
-`origin/auto/kit-pin-bump` at `9c82a23`, one commit ahead of `main`, touching only
-`package.json` and `package-lock.json`: `@jfs/vendor-cli` `276274b` (0.21.3) →
-`bf9b859` (0.21.6). Run 5's log even says `Branch 'auto/kit-pin-bump' is even with
-its remote and will not be updated` — it re-derived the same bump and failed to
-deliver it again.
+So each Monday the automation does correct, validated work and delivers it nowhere.
+On 2026-09-22 a session opened the PR by hand from the branch run 6 pushed (#42,
+`@jfs/vendor-cli` `276274b` (0.21.3) → `3e9e174` (0.21.7), `package.json` and
+`package-lock.json` only) and merged it on green CI; the branch was deleted with the
+merge. The pin is therefore current today — and that says nothing about next week.
 
 Two things make this worse here than in an app. First, `bin/vendor.mjs` is a shim
 that runs whatever `@jfs/vendor-cli` resolves from **inside this package**, so this
@@ -62,10 +66,10 @@ generator. Second, CLAUDE.md already records this exact class of failure once (t
 pin sat at 0.8.0 while the family shipped 0.17.0, closed by #29), and it recurred by
 a different mechanism, because a fix is not a monitor.
 
-Until the setting is changed, the bump is a manual job: `npm run kit-pins:bump`, then
-the gate, then a PR by hand. Note the stranded branch is already behind — vendor-cli
-`main` has moved past `bf9b859` — so re-running the bumper is better than merging the
-branch as-is.
+Until the setting is changed, the bump is a manual job: after a Monday run, open a PR
+from `auto/kit-pin-bump` (the run has already validated it), dispatch `test.yml` on
+the branch, and merge on green — or, if the branch is stale against `main`, run
+`npm run kit-pins:bump` locally, then the gate, then a PR by hand.
 
 ## The gate
 
@@ -83,7 +87,11 @@ npm test
 | --- | --- |
 | `node --check index.js` | parses the one shipped module. Parsing, which is not analysis. |
 | `npm run lint` | `eslint .` over `index.js`, `bin/**/*.mjs` and `*.mjs` with the Node globals plus the web-platform ones a function really has, and deliberately not the DOM-only ones |
-| `npm test` | `node --test test.mjs test-vendor.mjs` — **110 cases**, 101 + 9, all green on 2026-09-22 |
+| `npm test` | `node --test test.mjs test-vendor.mjs test-repo.mjs` — **117 cases** (104 + 9 + 4), all green on 2026-09-22. `test-repo.mjs` holds this repo's cross-file invariants; see below |
+
+`kit-pin-bump.yml`'s `check-command` is exactly these three lines, and `test-repo.mjs`
+fails if the two lists ever differ — until 2026-09-22 the bump skipped `npm run lint`,
+so a bumped tree was validated by a weaker gate than a pull request.
 
 Four properties of that chain matter more than the list.
 
@@ -91,24 +99,35 @@ Four properties of that chain matter more than the list.
 esm, global and cjs formats, and asserts the emitted surface is all 57 of `index.js`'s
 exports. That is why a vendor-cli pin bump is validated here rather than in eight
 consumers' `vendor:sync`, and why the bump's own check step passing (it did, against
-0.21.6) is real evidence and not a formality.
+0.21.6 and again against 0.21.7) is real evidence and not a formality.
 
-**The suite is not air-gapped.** Every *refusal* case in the guarded-article-fetch
-section is decided by the string-level guard and costs no lookup, but the happy paths
-resolve `example.com` through the real system resolver — `resolveHostIsPublic` is a
-live `dns.lookup`, and since 0.10.0 `fetchHtmlGuarded` validates its start URL the
-same way it validates a hop. The section header in `test.mjs` says so. On a runner
-with no DNS the guard refuses fail-closed and those cases go red, which reads like a
-code bug and is not one.
+**The suite needs no network, and that is recent.** Until 2026-09-22 the
+guarded-article-fetch happy paths resolved `example.com` through the real system
+resolver (`resolveHostIsPublic` is a live `dns.lookup`, and since 0.10.0
+`fetchHtmlGuarded` validates its start URL the same way it validates a hop). Measured
+with every lookup forced to fail: five of those tests went red reading like a code
+bug, and the oversized-body test passed for the wrong reason — it asserted only that
+the call rejected, and the DNS refusal satisfied it. The section now answers
+`dns.lookup` from a table (`withDns` in `test.mjs`), which also let the suite drive
+the answers a live resolver will not give on demand. That exposed a real gap: the
+resolved-IP check on a **redirect hop** — the one that stops a public page 302-ing to
+a name whose A record is `169.254.169.254` — was untested; deleting it left all 110
+cases green. Three new tests pin it, the start-URL half, and the fail-closed DNS
+ladder, and each was checked against a mutation of `index.js` that removes what it
+guards. The one real-resolver case left is `localhost is private`, which reads the
+hosts file, not the network.
 
-**family-ci adds three checks no local command here can run**: the kit-pin SHA
-pre-flight (`verify-kit-pins: true`), the CLAUDE.md family-conventions check (on by
-default), and — as of this commit — `maintenance-check: true`, which verifies both
-halves of this file. All three run from a checkout of vendor-cli's `main`, so "green
-locally, red in CI" is most often one of them rather than anything in `index.js`. That
-is also why `maintenance-check` cannot go green until vendor-cli's own change is
-merged: the input does not exist on its `main` yet, and a caller passing an unknown
-input fails. Dispatch this repo's CI after vendor-cli merges, not before.
+**family-ci adds four checks beyond the three commands**: the kit-pin SHA pre-flight
+(`verify-kit-pins: true`), the shipped-dependency audit (`prod-audit: true`, on since
+2026-09-22), the CLAUDE.md family-conventions check (on by default), and
+`maintenance-check: true`, which verifies both halves of this file. The pre-flight and
+the two doc checks run from a checkout of vendor-cli's `main`, not this repo's pin, so
+"green locally, red in CI" is most often one of them rather than anything in
+`index.js` — an edit to vendor-cli's canonical text reddens this repo with no commit
+in it. Locally they are `node <vendor-cli>/bin/check-kit-pins.mjs`,
+`node <vendor-cli>/bin/claude-md-sync.mjs --check`,
+`node <vendor-cli>/bin/maintenance-sync.mjs --check` and
+`node <vendor-cli>/tools/maintenance-doc-check.mjs`, from a vendor-cli checkout.
 
 **The version guard only fires on a real `pull_request` event.** family-ci's
 `version-bump` job carries `if: github.event_name == 'pull_request'`, so a
@@ -116,46 +135,54 @@ input fails. Dispatch this repo's CI after vendor-cli merges, not before.
 the default token fires no `pull_request` run at all. For a session-pushed change to
 `index.js` or `bin`, nothing checks that the version moved. Check it by hand; the
 whole point of the guard is that consumers pin by SHA and releases tag by version, so
-an unbumped shipped change puts two different SHAs under one version label.
+an unbumped shipped change puts two different SHAs under one version label. The fix
+is family-ci's (the job's `if:`), so it is recorded for vendor-cli, not changed here.
 
-Two gaps worth knowing rather than fixing blind. `kit-pin-bump.yml`'s `check-command`
-is `node --check index.js` plus `npm test` — it does **not** run `npm run lint`, so a
-bumped tree is validated by two of the gate's three steps. And `test.yml` does not
-pass family-ci's `prod-audit: true`, although — unlike its sibling kits — this one has
-a real `dependencies` entry: `@jfs/vendor-cli` → `esbuild` 0.25.10 and its platform
-binary. `npm audit --omit=dev --audit-level=high` reports 0 vulnerabilities today;
-run it by hand in the monthly sweep, or turn the input on.
+**CI installs with `npm ci`, and audits what ships.** `test.yml` passes
+`install-command: npm ci` (family-ci defaults to `npm install`), so a
+`package-lock.json` out of step with `package.json` fails the PR instead of the
+Monday bump, which installs with `npm ci`. And it passes `prod-audit: true`, because
+`dependencies` is not empty: `@jfs/vendor-cli` sits there on purpose and pulls
+`esbuild` (0.28.2 under vendor-cli 0.21.7) and its platform binary into every tree
+that installs this kit. Both went on 2026-09-22; `npm audit --omit=dev
+--audit-level=high` reported 0 vulnerabilities that day.
 
 ## This repo's cross-file invariants
 
 | Pair | Gated by | What breaks on drift |
 | --- | --- | --- |
 | `index.js`'s 57 exports ↔ the emitted esm / global / cjs surface | **gated** — `test-vendor.mjs` derives the surface from the source and asserts every name is exposed | a consumer imports a name the generated copy does not carry: a runtime `ReferenceError` in a deployed function |
-| `index.js`'s exports ↔ `test.mjs`'s imports | **not gated.** All 57 are named in `test.mjs` today (measured) — but nothing fails when the 58th is not | an export ships with no test and no signal |
-| `package.json`'s `files: ["index.js", "bin"]` ↔ `test.yml`'s `version-guard-paths: index.js bin` | **prose only** | add a third shipped file to `files` and it sits outside the version guard; a shipped change lands unbumped |
+| `index.js`'s exports ↔ `test.mjs`'s `import { … } from './index.js'` list | **gated** since 2026-09-22 — `test-repo.mjs`. A floor, not coverage: being imported is not being tested | an export ships with no test and no signal |
+| `package.json`'s `files: ["index.js", "bin"]` ↔ `test.yml`'s `version-guard-paths: index.js bin`, and `main` / `exports` / `bin` inside `files` | **gated** since 2026-09-22 — `test-repo.mjs`, set equality in both directions | add a third shipped file to `files` and it sits outside the version guard; a shipped change lands unbumped |
 | `package.json` `version` ↔ the provenance header of eight consumers' generated copies ↔ the `v<version>` tag | half gated: family-ci's version guard (PRs only) and `release.yml` | the tag and the header disagree with what shipped |
 | `_retryAfterMs` here ↔ `parseRetryAfter` in `@jfs/fetch-kit` | **prose only, and cross-repo** — each comment names the other | the twins drift on the guard that stops a retry storm. They *deliberately* differ: fetch-kit caps at its own constant and clamps to zero, this one returns the raw delta and lets `opts.capMs` cap it. Do not unify them |
 | `createResponders({ cors: false })` ↔ `createHandler({ cors: false })` | **gated** — the 429/414 case in `test.mjs` | one path keeps emitting `Access-Control-*` and an endpoint meant to be unreadable cross-origin is readable |
-| `README.md`'s API section and `package.json`'s `description` ↔ the actual export surface | **prose only** | it has already drifted in the direction that matters: CLAUDE.md records the description claiming capped *request* body reads for a release before `maxBodyBytes` existed. The README still says the suite is `node test.mjs`, which skips `test-vendor.mjs`'s 9 cases |
+| `README.md`'s `## API` section ↔ the actual export surface | **gated** since 2026-09-22 — `test-repo.mjs` fails on an export the section never names in backticks. Names only: what the README *says* about each export is still prose | an export nobody can discover from the docs |
+| `package.json`'s `description` and the README's prose ↔ what the code does | **prose only** | it has drifted in the direction that matters, twice: CLAUDE.md records the description claiming capped *request* body reads for a release before `maxBodyBytes` existed, and until 2026-09-22 the README gave the test command as `node test.mjs` (skipping the vendor suite), called the package "dependency-free at install time" beside a real `dependencies` entry, and named market-monitor's ESM copy as the CJS example |
 | `engines.node: ">=18"` ↔ what actually runs it (family-ci's default Node 22; no `.nvmrc` in this repo) ↔ the consumers' function runtimes | **prose only** | the declared floor is never executed by anything, here or downstream |
-| `kit-pin-bump.yml`'s `check-command` ↔ `test.yml`'s `run` block | **prose only** | the two diverge, as they do today, and a bump is validated by a weaker gate than a PR is |
+| `kit-pin-bump.yml`'s `check-command` ↔ `test.yml`'s `run` block | **gated** since 2026-09-22 — `test-repo.mjs` requires the same command lines | the two diverge — as they did until that day, when the bump skipped `npm run lint` — and a bump is validated by a weaker gate than a PR is |
 
 There is **no `@jfs-sanitizer-policy:` region in `index.js`** (measured: zero), so the
 vendoring generator's policy gate is a no-op for this kit. Do not add a marker
 expecting a check to arm itself; the gate belongs to news-kit.
 
-**The mechanization backlog**, in the order the payoff falls: the `files` ↔
-`version-guard-paths` pair and the README ↔ export-surface pair are both one small
-test over `package.json` plus a file read, and both guard something that has already
-drifted once. The export ↔ `test.mjs` pair is the same shape. The fetch-kit twin is
-the one nothing local can gate — it needs a family-level check, or it stays a comment.
+**The mechanization backlog.** Three invariants went into `test-repo.mjs` on
+2026-09-22, covering four rows of the table above — `files` ↔ the version guard (with
+`main` / `exports` / `bin` inside `files`), the bump's check-command ↔ CI's `run`, and
+the export surface ↔ both the README's API section and `test.mjs`'s imports — each a
+small read of two files that throws rather than passes when it cannot find what it
+compares. What is left: the fetch-kit `Retry-After` twin, which nothing local can
+gate (it needs a family-level check, or it stays a comment); `engines.node` against a
+runtime nothing here executes (see the deferred table — there is nothing to compare
+it to until a `.nvmrc` exists); and the README's *prose* about each export, which no
+test can read.
 
 ## What nothing watches
 
 | Thing | Whose it is | How it fails | Watched by |
 | --- | --- | --- | --- |
-| `DEFAULT_MODEL = 'claude-opus-4-8'` | Anthropic's model roster | silently, until the model is retired and every call 4xx's | nothing |
-| `ANTHROPIC_VERSION = '2023-06-01'` | Anthropic's API versioning | silently — a dropped version answers with an error the consumer renders as degraded mode | nothing |
+| `DEFAULT_MODEL = 'claude-opus-4-8'` | Anthropic's model roster | silently, until the model is retired and every call 4xx's | nothing but the monthly sweep. 2026-09-22: listed **Active** in the Claude API model reference (a cached copy dated 2026-06-24, not a live probe — this repo holds no key and calls no endpoint), with two newer Opus generations above it |
+| `ANTHROPIC_VERSION = '2023-06-01'` | Anthropic's API versioning | silently — a dropped version answers with an error the consumer renders as degraded mode | nothing but the monthly sweep. 2026-09-22: still the header every example in the same reference sends |
 | `DEFAULT_ANTHROPIC_TIMEOUT_MS = 25_000` | Netlify's synchronous-function ceiling (~26 s), which the comment sizes it against | silently: if the platform lowers the ceiling, this default stops being the binding limit and a stalled SSE runs to the invocation limit again | nothing |
 | The public CORS proxies `raceProxyHtml` races | third parties | loudly per attempt, silently in aggregate | nothing here. The proxy **list** lives in each consumer; only the racing lives in this kit |
 | Whether the consumers have re-vendored | the consumers | silently | nothing. See below |
@@ -163,31 +190,42 @@ the one nothing local can gate — it needs a family-level check, or it stays a 
 `DEFAULT_MODEL` is live, not decorative: Surf-Tracker's `resolveModel()` (in
 `netlify/functions/lib/ai-view.js`, used by its `summarize` and `summary-chat`
 functions) falls back to this kit's constant when `VIEW_SUMMARY_MODEL` and
-`SUMMARY_MODEL` are both unset. market-monitor's `analyze.mjs` names its own model
-instead. So a deprecation announcement that nobody here reads takes out one
-consumer's two AI endpoints, and the change would be made in this file.
+`SUMMARY_MODEL` are both unset (re-read on 2026-09-22: `resolveModel()` still ends in
+`|| DEFAULT_MODEL`). market-monitor's `analyze.mjs` names its own model instead. So a
+deprecation announcement that nobody here reads takes out one consumer's two AI
+endpoints, and the change would be made in this file. Moving the default to a newer
+model is **not** a maintenance edit: it changes the tier and the bill of every
+consumer that leans on it, and a newer Opus can reject request shapes this one
+accepts (thinking and `tool_choice` rules differ between generations) — so it is a
+product decision for the owner, taken with Surf-Tracker's summary prompts in hand.
 
 **"Green CI is not delivered" has a kit-specific shape: the tag is not the delivery,
-the re-vendor is.** `v0.10.0` is tagged and seven consumers pin `f4d2347`;
-**JFS-Sports pins `9a5a74e`**, four commits and one minor version behind, because its
-own weekly bump is broken for an unrelated reason. Its five functions call
-`fetchWithRetry` fourteen times, so the 0.10.0 `Retry-After` parse fix — the one that
-stops a `1.5` or `-5` header collapsing the backoff to zero and firing every retry at
-once — is written, tested, tagged, and not running in the one consumer that still has
-the bug. Nothing in this repository can see that. The check is a grep across the
-siblings' `package.json` for the `@jfs/netlify-kit` pin, and it belongs in the monthly
-sweep.
+the re-vendor is.** Until 2026-09-22 `v0.10.0` was tagged and seven consumers pinned
+`f4d2347` while **JFS-Sports pinned `9a5a74e`**, four commits and one minor version
+behind, because its own weekly bump was broken for an unrelated reason — so the
+0.10.0 `Retry-After` parse fix (the one that stops a `1.5` or `-5` header collapsing
+the backoff to zero and firing every retry at once) was written, tested, tagged, and
+not running in the one consumer that calls `fetchWithRetry` fourteen times. That
+closed the same day: JFS-Sports' fixed bump merged (its #720) and pins `eb93e04`,
+whose `index.js` is 0.10.0's byte for byte. Checked on each sibling's `origin/main`
+that day: all eight consumers' generated copies carry the `v0.10.0` provenance header
+and the 0.10.0 body. Nothing in this repository can see that. The check is a grep
+across the siblings' `package.json` for the `@jfs/netlify-kit` pin, plus the first
+line of each generated copy, and it belongs in the monthly sweep.
 
-Also not this repo's to fix, but visible in every one of its bump runs:
-`peter-evans/create-pull-request@84ae59a` inside the shared workflow targets Node 20,
-and the runner warns on every run that it is being forced onto Node 24.
+Also not this repo's to fix, but visible in every one of its bump runs (run 6
+included): `peter-evans/create-pull-request@84ae59a` inside the shared workflow
+targets Node 20, and the runner warns on every run that it is being forced onto Node
+24. The fix is vendor-cli's open Dependabot PR #49 (create-pull-request 8.1.1), a
+major bump waiting on a review there.
 
 ## Cost and quota exposure
 
 This repo spends nothing at runtime. Its only recurring cost is GitHub Actions
 minutes for four workflows, and the weekly bump currently burns about twenty seconds
-a week to fail. `npm ci` installs one git dependency and prints
-`skipping integrity check for git dependency` — expected for a SHA pin, not a finding.
+a week to fail. `npm ci` (CI's install since 2026-09-22, and the bump's) installs one
+git dependency and prints `skipping integrity check for git dependency` — expected
+for a SHA pin, not a finding.
 
 Everything else this kit costs is spent on somebody else's behalf, which is the
 reason to be careful in a file that looks free to edit:
@@ -230,9 +268,9 @@ changes their bytes. `package-lock.json` is committed and is the bump's to rewri
 
 | Item | Current → target | Verdict | Why | What would change the answer |
 | --- | --- | --- | --- | --- |
-| `@jfs/vendor-cli` pin | `276274b` (0.21.3) → vendor-cli `main` | **blocked, not deferred** | the bump is computed and validated every Monday and cannot be delivered; the cause is a repo setting | the "create and approve pull requests" permission, or a manual PR |
+| `@jfs/vendor-cli` pin | `3e9e174` (0.21.7) — vendor-cli `main` on 2026-09-22 | **current, by hand; the automation is still blocked** | landed by a hand-opened PR (#42) from the branch the bump pushed; next Monday's bump will again validate, push, and fail to open its PR | the "create and approve pull requests" permission (owner only). Until then: a manual PR from `auto/kit-pin-bump` after each Monday run |
 | `engines.node` | `>=18` → `>=22` | hold, but decide it deliberately | nothing executes 18: CI rides family-ci's default 22 and this repo has no `.nvmrc` to point `node-version-file` at. `index.js` uses no builtin above 18 (measured: no `Object.groupBy`, `Promise.withResolvers`, `toSorted`, `structuredClone`, `findLast`), so raising the floor buys nothing today | an `index.js` change that wants a newer builtin, or a consumer's function runtime moving — then raise it in the same commit |
-| npm majors | none open | — | zero open PRs on 2026-09-22, and the three devDependencies are on their latest majors (registry latest today: `eslint` 10.11.0, `globals` 17.12.0, `@eslint/js` 10.0.1) | Dependabot opening one. Then use the classes-of-proof table in the family block below: this kit's suite stubs `globalThis.fetch` and injects `fetchFn` / `fetchImpl` everywhere, so an HTTP-client major is proved by reading call sites, not by a green run |
+| npm majors | none open | — | zero open PRs on 2026-09-22 (the day's minor bump, #41, merged itself), `npm outdated` is empty, and the three devDependencies are on their registry latest (`eslint` 10.11.0, `globals` 17.12.0, `@eslint/js` 10.0.1) | Dependabot opening one. Then use the classes-of-proof table in the family block below: this kit's suite stubs `globalThis.fetch` and injects `fetchFn` / `fetchImpl` everywhere, so an HTTP-client major is proved by reading call sites, not by a green run |
 
 One defect is documented and deliberately **not** fixed, and CLAUDE.md says why:
 `looksLikeNumericIp`'s short-form IPv4 hole (`127.1`, `10.0.1`) is unreachable,
@@ -309,13 +347,15 @@ In this order, fastest-resolving first.
    vendor-cli's `main` HEAD. `npm run kit-pins:bump` does the bump locally.
 5. **Lint dies with `ERR_MODULE_NOT_FOUND ... '@eslint/js'`** — that is a missing or
    partial `node_modules`, not a config bug. `npm ci`.
-6. **The suite is red only in the guarded-article-fetch section, with
-   `redirect resolves to a private host`** (the DNS half of `assertSafePublicUrl`, as
-   opposed to `unsafe redirect target`, which is the string half and needs no
-   network) — suspect DNS, not code:
-   `node -e "import('./index.js').then(m=>m.resolveHostIsPublic('example.com')).then(console.log)"`.
-   `{ ok: false, error: 'dns-failed' }` is the resolver; `{ ok: true, error: null }`
-   means the failure is real.
+6. **A guarded-article-fetch test is red with `redirect resolves to a private
+   host`** (the DNS half of `assertSafePublicUrl`, as opposed to `unsafe redirect
+   target`, which is the string half). Since 2026-09-22 that section's lookups come
+   from `withDns`'s table, not the network, so this is no longer a resolver problem:
+   either the test's table does not name the host the code now looks up, or the code
+   really refused. Read the `asked` list the test records. The one test that still
+   uses the real resolver is `resolveHostIsPublic: localhost is private`; if only it is
+   red, check the runner's hosts file:
+   `node -e "import('./index.js').then(m=>m.resolveHostIsPublic('localhost')).then(console.log)"`.
 7. **A consumer broke after a re-vendor.** The copy is `index.js` verbatim under a
    header, so regenerate one locally and diff it before suspecting the generator:
    `node bin/vendor.mjs --format esm --out /tmp/probe.js` (or `--format cjs`). If the
@@ -328,6 +368,7 @@ In this order, fastest-resolving first.
 
 | Date | Cadence | Found / done |
 | --- | --- | --- |
+| 2026-09-22 | Weekly + monthly sweep | **Weekly.** Kit-pin bump: last scheduled run (09-21) and the day's dispatch (run 6) both `failure` at *Open a pull request* — the repo setting, unchanged; the orchestrator opened #42 by hand from the branch run 6 pushed and it merged at `e399e37`, so the vendor-cli pin is `3e9e174` (0.21.7) = vendor-cli `main`, and `auto/kit-pin-bump` is gone with the merge. No stranded `auto/*` branch; one stale non-bot branch, `claude/family-review-3urdej` at `414cf2f`, is an ancestor of `main` with nothing unique on it (owner may delete it; a session may not). Test, Release and Dependabot merge green on `main`; no open PRs, no bot PR older than a week. **Baseline gate** clean on `e399e37`: `node --check`, lint, 110/110, `maintenance-doc-check`, both sync checks, kit-pin pre-flight, prod audit 0. **Found and fixed:** (1) the bump's `check-command` omitted `npm run lint` — added, and `test-repo.mjs` now fails if it differs from `test.yml`'s `run`; (2) `prod-audit` was off with a real prod tree (vendor-cli → esbuild 0.28.2) — on; (3) CI installed with `npm install` while the bump uses `npm ci` and the bump's comment claimed CI did too — `install-command: npm ci`; (4) the suite needed live DNS: with lookups forced to fail, 5 guarded-fetch tests went red and the oversized-body test passed for the wrong reason — the section now answers `dns.lookup` from a table, and doing so showed that deleting the resolved-IP check on a redirect HOP left all 110 tests green; three new tests pin the hop, the start URL and the fail-closed ladder, each checked against a mutation of `index.js`; (5) three mechanized invariants in the new `test-repo.mjs` (`files` ↔ version guard plus entry points, bump ↔ CI commands, exports ↔ README API names and `test.mjs` imports); (6) false docs: README test command, "dependency-free at install time", the CJS example naming market-monitor's ESM copy, and "cached" DNS lookup in README and CLAUDE.md. 117/117 after. No `index.js`/`bin` change, so no version bump. **Monthly.** `npm outdated` empty, no majors open, audit 0. Upstreams: this kit owns no probe; read `DEFAULT_MODEL` (`claude-opus-4-8`, Active in the cached model reference, still Surf-Tracker's live fallback) and `ANTHROPIC_VERSION` — both recorded, neither changed (a model change is the owner's). Delivery: all eight consumers' `origin/main` copies carry v0.10.0 — JFS-Sports' bump (#720) closed the one gap this file recorded. **Left open:** the Actions PR-permission setting (owner); vendor-cli's `FAMILY_READ_TOKEN` (owner, vendor-cli #60); family-ci's version guard never runs on a dispatched branch (vendor-cli's); `index.js`'s own "cached DNS lookup" comment (fix with the next version-bumping change, not alone); the fetch-kit twin and `engines.node` stay prose. |
 | 2026-09-22 | plan written | Wrote this file and turned on family-ci's `maintenance-check`. Gate verified green by hand: `node --check index.js`, `eslint .` clean, 110/110 tests. Confirmed from Actions history that `kit-pin-bump.yml` has **never** succeeded — 5 scheduled runs, 5 failures; runs 1–3 on `Missing script: "vendor:sync"` (fixed by #35), runs 4–5 on `GitHub Actions is not permitted to create or approve pull requests` at the PR step, with steps 1–10 including the bumped-tree CI check green. The bump it cannot deliver is on `origin/auto/kit-pin-bump` (`9c82a23`): vendor-cli 0.21.3 → 0.21.6. Found that JFS-Sports is the one consumer still pinning `9a5a74e`, so 0.10.0's `Retry-After` fix is tagged but not running where `fetchWithRetry` is called 14 times. Also recorded: the version guard never runs on a dispatched branch; the bump's check-command omits `npm run lint`; `prod-audit` is off although this kit has a real prod dependency tree; the suite needs working DNS for the guarded-article-fetch happy paths; and `DEFAULT_MODEL` is Surf-Tracker's live fallback. No code changed. |
 
 <!-- maintenance-check:allow

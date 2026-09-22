@@ -38,7 +38,7 @@
     "bin"
   ],
   "scripts": {
-    "test": "node --test test.mjs test-vendor.mjs",
+    "test": "node --test test.mjs test-vendor.mjs test-repo.mjs",
     "lint": "eslint .",
     "kit-pins:bump": "jfs-bump-kit-pins"
   },

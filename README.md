@@ -12,10 +12,15 @@ drifts slightly, and the differences are exactly the subtle correctness bugs a
 single tested implementation eliminates (a double-decoded `&`, an unbounded
 `await res.text()`, a metadata-IP SSRF hole). This package is that single copy.
 
-Pure ESM, **dependency-free at install time**. The one optional integration —
-Netlify Blobs for distributed rate limiting — is reached through a dynamic
-`import('@netlify/blobs')` that degrades to the in-memory limiter when the
-package (or a configured store) isn't present.
+Pure ESM, and `index.js` **imports nothing at runtime** — a consumer's
+vendored copy carries no dependency at all. The package's one `dependencies`
+entry is `@jfs/vendor-cli` (with esbuild behind it), which only the
+`jfs-netlify-kit-vendor` bin uses: the bin resolves the CLI from inside this
+package, so this pin decides which generator every consumer vendors through.
+The one optional runtime integration — Netlify Blobs for distributed rate
+limiting and the TTL cache — is reached through a dynamic
+`import('@netlify/blobs')` that degrades to a no-op / the in-memory limiter
+when the package (or a configured store) isn't present.
 
 ## Compatibility superset
 
@@ -108,7 +113,8 @@ guards on one URL, throws or returns the normalized string),
 `fetchHtmlGuarded(startUrl, { headers, timeoutMs, maxBytes, maxRedirects })`
 (manual redirect handling with BOTH guards re-run on every hop **and on
 `startUrl` itself** since 0.10.0 — the guard is idempotent, so a caller that
-already checked pays one cached lookup rather than owning the contract;
+already checked pays one more DNS lookup (the kit keeps no cache of its own)
+rather than owning the contract;
 byte-capped read; never hand a URL to a library that follows redirects itself
 — fetch here, give it HTML), `raceProxyHtml(target, proxies, parse, opts)`
 (race public CORS proxies, status/size/shape-checked, first result the
@@ -217,12 +223,20 @@ CI drift check. The kit ships its own vendoring CLI (`jfs-netlify-kit-vendor`):
 ```
 
 Use `--format cjs` instead when the consumer's functions are CommonJS (it
-emits a `module.exports` transform, e.g. market-monitor's
-`netlify/functions/utils/netlify-kit.js`). The exported surface is derived
+emits a `module.exports` transform, e.g. Surf-Tracker's
+`netlify/functions/lib/netlify-kit.js`). The exported surface is derived
 from `index.js`'s own `export` declarations — never a hand-maintained list.
 
 ## Test
 
 ```bash
-npm test     # node test.mjs — node:test, no framework deps
+npm test     # node --test test.mjs test-vendor.mjs test-repo.mjs — node:test, no framework deps
 ```
+
+`test.mjs` is the API suite, `test-vendor.mjs` drives the pinned vendoring
+CLI over this kit's own source (esm, global and cjs), and `test-repo.mjs`
+holds this repository's cross-file invariants (every export documented here
+and imported by the suite, the shipped `files` under CI's version guard, the
+weekly bump running the same checks as a pull request). The suite needs no
+network access: the guarded fetch's DNS half is answered from a table, and
+the one real-resolver case looks up `localhost`.

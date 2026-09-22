@@ -23,8 +23,18 @@ picks them up on a pin bump and can't see the diff.
   the hops it DISCOVERED, documenting the start URL as the caller's job — so
   the one URL an attacker actually supplies was the only one the function took
   on trust, and a consumer that forgot had no guard at all. `assertSafePublicUrl`
-  is idempotent, so a caller that already checked pays one cached DNS lookup.
+  is idempotent, so a caller that already checked pays one more DNS lookup —
+  not a "cached" one, as this note and the function's own comment used to say:
+  the kit keeps no cache, and `dns.lookup` is a fresh `getaddrinfo` unless the
+  host OS caches. (The comment in `index.js` still says "cached"; fix it with
+  the next change that bumps the version, not on its own — a comment is not
+  worth re-vendoring eight consumers for.)
   The call sits BEFORE the AbortController, so a refusal leaves no timer behind.
+  The suite drives both halves of that guard through a table-backed
+  `dns.lookup` (`withDns` in `test.mjs`), so it needs no network — and the
+  resolved-IP check on a redirect HOP, the one that stops a public page
+  302-ing to a name whose A record is `169.254.169.254`, is now tested;
+  before 2026-09-22 deleting it left the whole suite green.
 - **`raceProxyHtml` string-guards its `target`.** The proxies fetch from their
   own egress, which is why the resolved-IP half doesn't apply — but a
   caller-supplied `file:`/`http:`/internal-host target still went straight into
