@@ -1572,11 +1572,15 @@ test('fetchHtmlGuarded: a start url whose host RESOLVES private is refused befor
 
 test('fetchHtmlGuarded: a redirect hop that resolves to the metadata address is refused, never fetched', async () => {
   // The open-redirect walk the guarded fetch exists for: a public page 302s to
-  // a public-LOOKING name whose A record is 169.254.169.254.
+  // a public-LOOKING name whose A records are one genuinely public address and
+  // 169.254.169.254. The public one must really BE public — a TEST-NET address
+  // (203.0.113.0/24, say) is in the kit's private list, which would make this
+  // an all-private answer and let a guard that checks only the first address
+  // pass here.
   const fetched = [];
   await withDns({
     'example.com': PUBLIC_V4,
-    'cdn.example': [{ address: '203.0.113.9', family: 4 }, { address: '169.254.169.254', family: 4 }],
+    'cdn.example': [...PUBLIC_V4, { address: '169.254.169.254', family: 4 }],
   }, (asked) => withFetch(async (url) => {
     fetched.push(url);
     return htmlRes(302, '', { location: 'https://cdn.example/latest/meta-data/' });
