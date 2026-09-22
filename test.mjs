@@ -3,6 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import dns from 'node:dns';
 import {
   corsHeaders,
   handlePreflight,
@@ -1388,11 +1389,42 @@ test('rateLimit: well-formed IPv6 addresses still get their own buckets', () => 
 // ─────────────── guarded article fetch (0.9.0) ───────────────
 //
 // fetchHtmlGuarded / raceProxyHtml drive the real global fetch, so these
-// tests stub globalThis.fetch and restore it. Every REFUSAL case is decided by
-// the string-level guard, so it costs no lookup; the happy paths do resolve
-// example.com, because fetchHtmlGuarded now validates its start URL the same
-// way it validates a redirect hop (0.10.0) and that half of the guard is a
-// real DNS query.
+// tests stub globalThis.fetch and restore it. Every STRING-level refusal costs
+// no lookup. Everything that reaches the resolved-IP half — the happy paths,
+// since fetchHtmlGuarded validates its start URL the same way it validates a
+// redirect hop (0.10.0) — runs under withDns, which answers the kit's
+// dns.lookup from a table.
+//
+// That is deliberate, and it replaced a live lookup of example.com. With the
+// real resolver this section needed working DNS: on a runner without it the
+// guard refused fail-closed, five tests went red reading like a code bug, and
+// the oversized-body test passed for the WRONG reason (it asserted only that
+// the call rejected, and the DNS refusal satisfied it). A table also lets the
+// suite drive the answers a live resolver will not give on demand — a host
+// that resolves private, a lookup that fails — which is the half of the guard
+// that stops the 169.254.169.254 metadata trick, and was untested until then.
+// The kit reads `lookup` off `node:dns`'s promises object at call time, so
+// patching that one property is enough; every use restores it.
+
+const PUBLIC_V4 = [{ address: '93.184.215.14', family: 4 }];
+function withDns(table, run) {
+  const saved = dns.promises.lookup;
+  const asked = [];
+  dns.promises.lookup = async (hostname, opts) => {
+    asked.push(hostname);
+    const hit = Object.hasOwn(table, hostname) ? table[hostname] : undefined;
+    if (hit instanceof Error) throw hit;
+    if (hit === undefined) {
+      const e = new Error(`getaddrinfo ENOTFOUND ${hostname}`);
+      e.code = 'ENOTFOUND';
+      throw e;
+    }
+    return opts && opts.all ? hit : hit[0];
+  };
+  return Promise.resolve()
+    .then(() => run(asked))
+    .finally(() => { dns.promises.lookup = saved; });
+}
 
 const savedFetch = globalThis.fetch;
 function withFetch(fn, run) {
@@ -1465,31 +1497,37 @@ test('raceProxyHtml: an unsafe target is refused before it reaches a proxy', asy
 });
 
 test('fetchHtmlGuarded: returns the final page html and url', async () => {
-  await withFetch(async (url, init) => {
+  await withDns({ 'example.com': PUBLIC_V4 }, (asked) => withFetch(async (url, init) => {
     assert.equal(init.redirect, 'manual');
     return htmlRes(200, '<html>hi</html>');
   }, async () => {
     const r = await fetchHtmlGuarded('https://example.com/story');
     assert.equal(r.html, '<html>hi</html>');
     assert.equal(r.finalUrl, 'https://example.com/story');
-  });
+    // 0.10.0: the START url goes through the resolved-IP half too, not only
+    // the hops the function discovers.
+    assert.deepEqual(asked, ['example.com'], 'the start host must be resolved and vetted');
+  }));
 });
 
 test('fetchHtmlGuarded: non-ok status throws', async () => {
-  await withFetch(async () => htmlRes(404, 'nope'), async () => {
+  await withDns({ 'example.com': PUBLIC_V4 }, () => withFetch(async () => htmlRes(404, 'nope'), async () => {
     await assert.rejects(() => fetchHtmlGuarded('https://example.com/x'), /HTTP 404/);
-  });
+  }));
 });
 
 test('fetchHtmlGuarded: oversized body throws instead of buffering', async () => {
-  await withFetch(async () => htmlRes(200, 'x'.repeat(64)), async () => {
-    await assert.rejects(() => fetchHtmlGuarded('https://example.com/x', { maxBytes: 16 }));
-  });
+  await withDns({ 'example.com': PUBLIC_V4 }, () => withFetch(async () => htmlRes(200, 'x'.repeat(64)), async () => {
+    await assert.rejects(
+      () => fetchHtmlGuarded('https://example.com/x', { maxBytes: 16 }),
+      (e) => e.tooLarge === true && /too large/.test(e.message),
+    );
+  }));
 });
 
 test('fetchHtmlGuarded: redirect cap is enforced before any hop is fetched', async () => {
   let calls = 0;
-  await withFetch(async () => {
+  await withDns({ 'example.com': PUBLIC_V4 }, () => withFetch(async () => {
     calls++;
     return htmlRes(301, '', { location: 'https://example.com/next' });
   }, async () => {
@@ -1498,23 +1536,73 @@ test('fetchHtmlGuarded: redirect cap is enforced before any hop is fetched', asy
       /too many redirects/
     );
     assert.equal(calls, 1, 'the hop past the cap must never be fetched');
-  });
+  }));
 });
 
 test('fetchHtmlGuarded: a redirect to a non-https target is refused (no fetch of the hop)', async () => {
   let calls = 0;
-  await withFetch(async () => {
+  await withDns({ 'example.com': PUBLIC_V4 }, () => withFetch(async () => {
     calls++;
     return htmlRes(302, '', { location: 'http://internal.service/admin' });
   }, async () => {
     await assert.rejects(() => fetchHtmlGuarded('https://example.com/x'), /unsafe redirect target/);
     assert.equal(calls, 1);
-  });
+  }));
 });
 
 test('fetchHtmlGuarded: a 3xx with no Location throws', async () => {
-  await withFetch(async () => htmlRes(301, ''), async () => {
+  await withDns({ 'example.com': PUBLIC_V4 }, () => withFetch(async () => htmlRes(301, ''), async () => {
     await assert.rejects(() => fetchHtmlGuarded('https://example.com/x'), /redirect without location/);
+  }));
+});
+
+test('fetchHtmlGuarded: a start url whose host RESOLVES private is refused before any fetch', async () => {
+  // Passes every string-level rule — a plain public-looking https name — and
+  // is only caught by the resolved-IP half: a DNS name pointed at an internal
+  // address is how an attacker walks past a string guard.
+  let calls = 0;
+  await withDns({ 'intranet.example': [{ address: '10.0.0.7', family: 4 }] }, () => withFetch(async () => {
+    calls++;
+    return htmlRes(200, '<html>secret</html>');
+  }, async () => {
+    await assert.rejects(() => fetchHtmlGuarded('https://intranet.example/'), /redirect resolves to a private host/);
+  }));
+  assert.equal(calls, 0, 'nothing may be fetched for a start host that resolves private');
+});
+
+test('fetchHtmlGuarded: a redirect hop that resolves to the metadata address is refused, never fetched', async () => {
+  // The open-redirect walk the guarded fetch exists for: a public page 302s to
+  // a public-LOOKING name whose A record is 169.254.169.254.
+  const fetched = [];
+  await withDns({
+    'example.com': PUBLIC_V4,
+    'cdn.example': [{ address: '203.0.113.9', family: 4 }, { address: '169.254.169.254', family: 4 }],
+  }, (asked) => withFetch(async (url) => {
+    fetched.push(url);
+    return htmlRes(302, '', { location: 'https://cdn.example/latest/meta-data/' });
+  }, async () => {
+    await assert.rejects(() => fetchHtmlGuarded('https://example.com/story'), /redirect resolves to a private host/);
+    assert.deepEqual(asked, ['example.com', 'cdn.example'], 'the hop is vetted through DNS before it is fetched');
+  }));
+  assert.deepEqual(fetched, ['https://example.com/story'], 'the private hop must never be fetched');
+});
+
+test('resolveHostIsPublic: every rung of the DNS ladder fails closed', async () => {
+  // "Could not check" must never read as "public": a failed lookup, an empty
+  // answer and a mixed answer are three different refusals, and only an
+  // all-public answer is ok.
+  const failure = Object.assign(new Error('getaddrinfo EAI_AGAIN down.example'), { code: 'EAI_AGAIN' });
+  await withDns({
+    'down.example': failure,
+    'empty.example': [],
+    'mixed.example': [{ address: '93.184.215.14', family: 4 }, { address: 'fd00::1', family: 6 }],
+    'public.example': [{ address: '93.184.215.14', family: 4 }, { address: '2606:2800:21f:cb07::1', family: 6 }],
+  }, async () => {
+    assert.deepEqual(await resolveHostIsPublic('down.example'), { ok: false, error: 'dns-failed' });
+    assert.deepEqual(await resolveHostIsPublic('unknown.example'), { ok: false, error: 'dns-failed' });
+    assert.deepEqual(await resolveHostIsPublic('empty.example'), { ok: false, error: 'dns-empty' });
+    assert.deepEqual(await resolveHostIsPublic('mixed.example'), { ok: false, error: 'private-ip', address: 'fd00::1' });
+    assert.deepEqual(await resolveHostIsPublic('public.example'), { ok: true, error: null });
   });
 });
 
