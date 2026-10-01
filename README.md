@@ -185,7 +185,13 @@ distributed, cors, handle, onError })`.
   pair it with `createResponders({ cors: false })` inside `handle` for a fully
   CORS-free endpoint.
 
-**Anthropic (Claude) client** — hardened Messages-API call machinery,
+**Anthropic (Claude) client — retained, unused since 2026-09-30.** No consumer
+calls it: Surf-Tracker removed its AI summaries and market-monitor its Claude
+fallback that day, so this section documents shipped surface, not a live
+integration. The exception is `userFacingReason`, which reads only the
+`.status`/`.retryAfter` tags and which market-monitor's Gemini `analyze.mjs`
+still uses. Removal is a deferred minor release (see MAINTENANCE.md); until then
+every consumer's copy carries it. Hardened Messages-API call machinery,
 consolidated from Surf-Tracker's non-streaming client (`lib/anthropic.js`) and
 market-monitor's streaming client (`utils/anthropic.mjs`). Raw `fetch` with
 `x-api-key` only (deliberately not the SDK — its env-based auth attached a
@@ -205,11 +211,13 @@ api key or the raw upstream body, and `.status`/`.retryAfter` tagging.
 - `parseModelJson(text)` — first balanced JSON object out of prose/fences.
 - `toBullets(v, maxChars)` — normalize a model value into capped bullets.
 - `userFacingReason(e, detail)` — honest 429 "busy, wait Ns" message from the
-  tagged `retryAfter`; `detail` otherwise.
+  tagged `retryAfter`, and a plain "unavailable" line for a 5xx/529; `detail`
+  otherwise. Provider-neutral in practice — any status-tagged error works.
 - `normalizeEffort(value, def='low')` — validate an env-configured
   `output_config.effort` level (`low`…`max`).
-- `ANTHROPIC_VERSION`, `DEFAULT_MODEL` — Opus 4.8; pair with explicit
-  `effort` to stay inside a synchronous function's time budget.
+- `ANTHROPIC_VERSION`, `DEFAULT_MODEL` — the API-version header and the default
+  model id; pair the model with an explicit `effort` to stay inside a synchronous
+  function's time budget.
 
 ## Vendoring into a consumer
 
@@ -234,7 +242,8 @@ npm test     # node --test test.mjs test-vendor.mjs test-repo.mjs — node:test,
 ```
 
 `test.mjs` is the API suite, `test-vendor.mjs` drives the pinned vendoring
-CLI over this kit's own source (esm, global and cjs), and `test-repo.mjs`
+CLI over this kit's own source (esm — full and `--pick`-narrowed — global and
+cjs, with every refusal matched on its stderr reason), and `test-repo.mjs`
 holds this repository's cross-file invariants (every export documented here
 and imported by the suite, the shipped `files` under CI's version guard, the
 weekly bump running the same checks as a pull request). The suite needs no
