@@ -138,8 +138,17 @@ injectable `fetchFn`/`sleepFn`/`rng`), `RETRYABLE_STATUSES`.
   `name: 'TimeoutError'` / `.timedOut = true` (with `retries: 0` it surfaces
   immediately); a caller-signal abort stays terminal. Together they cover the
   billed-upstream shape (never retry a per-query-billed request, but bound the
-  one attempt — FlightCheck's `fetchWithTimeout`), while omitting
-  `attemptTimeoutMs` leaves existing callers byte-identical.
+  one attempt's wait for its headers — FlightCheck's `fetchWithTimeout`), while
+  omitting `attemptTimeoutMs` leaves existing callers byte-identical.
+  **The per-attempt deadline ends when `fetch` resolves — at the response
+  headers, not the body.** Its timer is cleared once the attempt returns, and
+  with `attemptTimeoutMs` set the request carries the kit's own signal, so an
+  `init.signal` budget reaches it only until the headers arrive: a body that
+  stalls after them is bounded by neither. (Without `attemptTimeoutMs`, an
+  `init.signal` budget does cover the body.) A caller that reads the body under
+  a deadline ties the request to a whole-request signal through `fetchFn` —
+  `fetchFn: (u, i) => fetch(u, { ...i, signal: i?.signal ? AbortSignal.any([i.signal, budget]) : budget })`,
+  the pattern Weather's nowcast/airnow and Art-Gallery-'s proxy already use.
 
 **Rate limiting**
 - `checkRateLimit(event, max, windowMs, opts?)` / `checkRateLimitDistributed(...)`

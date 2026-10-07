@@ -615,6 +615,19 @@ test('fetchWithRetry: without attemptTimeoutMs, init passes through untouched', 
   assert.strictEqual(seen, init);
 });
 
+test('fetchWithRetry: attemptTimeoutMs bounds time-to-headers only', async () => {
+  // README: the per-attempt deadline ends when fetch resolves (the headers);
+  // a caller reading the body bounds it itself. If the kit ever starts
+  // aborting after the headers, this goes red and the README is wrong again.
+  let seen;
+  await fetchWithRetry('u', {}, {
+    fetchFn: async (url, i) => { seen = i.signal; return { status: 200 }; },
+    sleepFn: noSleep, retries: 0, attemptTimeoutMs: 20,
+  });
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(seen.aborted, false);
+});
+
 // ──────────────────────── rate limiting ─────────────────────────
 
 test('clientIp: precedence', () => {
@@ -704,13 +717,63 @@ test('checkRateLimitDistributed (CAS): exhausted conflicts fail closed (deny)', 
 });
 
 test('checkRateLimitDistributed: read error falls back by default, denies when failClosed', async () => {
+  _resetRateLimit();
   const boom = { getWithMetadata: async () => { throw new Error('blobs down'); } };
+  // Default: fall back to the in-memory limiter, which still limits.
   const ev = eventWith({ headers: { 'x-forwarded-for': '8.8.2.2' } });
-  // Default: fall back to the in-memory limiter (permits the first hit).
   assert.equal(await checkRateLimitDistributed(ev, 1, 60_000, { store: boom }), null);
-  // failClosed: deny on the read error instead of falling back.
-  const r = await checkRateLimitDistributed(ev, 1, 60_000, { store: boom, failClosed: true });
+  assert.equal((await checkRateLimitDistributed(ev, 1, 60_000, { store: boom })).statusCode, 429);
+  // failClosed: deny on the read error. A FRESH address at max 60, which the
+  // in-memory fallback would admit, so only a working failClosed denies it
+  // (reusing the address above passed whether failClosed was honoured or not).
+  const fresh = eventWith({ headers: { 'x-forwarded-for': '198.51.100.1' } });
+  const r = await checkRateLimitDistributed(fresh, 60, 60_000, { store: boom, failClosed: true });
   assert.equal(r.statusCode, 429);
+});
+
+test('checkRateLimitDistributed: a thrown write never blanket-allows (falls back, or denies when failClosed)', async () => {
+  _resetRateLimit();
+  const writeDown = {
+    getWithMetadata: async () => ({ data: null, etag: null }),
+    setJSON: async () => { throw new Error('blobs write down'); },
+    delete: async () => {},
+  };
+  // Default: the in-memory fallback still counts, so the second hit at max 1 is denied.
+  const ev = eventWith({ headers: { 'x-forwarded-for': '198.51.100.2' } });
+  assert.equal(await checkRateLimitDistributed(ev, 1, 60_000, { store: writeDown }), null);
+  assert.equal((await checkRateLimitDistributed(ev, 1, 60_000, { store: writeDown })).statusCode, 429);
+  // failClosed: a fresh address at max 60 is denied outright.
+  const fresh = eventWith({ headers: { 'x-forwarded-for': '198.51.100.3' } });
+  const r = await checkRateLimitDistributed(fresh, 60, 60_000, { store: writeDown, failClosed: true });
+  assert.equal(r.statusCode, 429);
+});
+
+test('checkRateLimitDistributed (CAS): concurrent callers that all read the same count still admit exactly max', async () => {
+  // Five instances read the bucket before any of them writes (a barrier on
+  // promise resolution, no timers). Only the conditional write (onlyIfNew /
+  // onlyIfMatch) stops all five from writing count=1 and passing.
+  const inner = casStore();
+  const N = 5;
+  let arrived = 0;
+  let release;
+  const allRead = new Promise((r) => { release = r; });
+  const store = {
+    ...inner,
+    getWithMetadata: async (k) => {
+      const meta = await inner.getWithMetadata(k);
+      if (arrived < N) {
+        arrived += 1;
+        if (arrived === N) release();
+        await allRead;
+      }
+      return meta;
+    },
+  };
+  const ev = eventWith({ headers: { 'x-forwarded-for': '198.51.100.4' } });
+  const results = await Promise.all(Array.from({ length: N }, () =>
+    checkRateLimitDistributed(ev, 3, 60_000, { store, retries: N })));
+  assert.equal(results.filter((r) => r === null).length, 3, 'exactly max admitted');
+  assert.equal(results.filter((r) => r && r.statusCode === 429).length, 2);
 });
 
 test('rateLimit (Surf form): { ok, retryAfter } with injected clock', () => {
@@ -766,8 +829,11 @@ test('limiter: a cardinality flood evicts idle keys via LRU, never wipes an acti
     }
   };
   const active = eventWith({ headers: { 'x-nf-client-connection-ip': '9.9.9.9' } });
-  // Background flood populates the map with many now-idle keys at t.
-  flood(5100, 1_000_000, '10');
+  // Background flood populates the map with many now-idle keys at t — kept
+  // UNDER the cap. Crossing it here, before the active counter exists, let a
+  // whole-map clear() pass this test (measured against the pre-fix body,
+  // 6cead82^): the wipe happened during the flood, never across the counter.
+  flood(4990, 1_000_000, '10');
   // The active client burns its budget slightly later — now the MRU entries.
   for (let k = 0; k < max; k++) assert.equal(rateLimit(active, { name, windowMs: W, max }, 1_000_001).ok, true);
   assert.equal(rateLimit(active, { name, windowMs: W, max }, 1_000_001).ok, false); // limited
@@ -775,6 +841,10 @@ test('limiter: a cardinality flood evicts idle keys via LRU, never wipes an acti
   // client (pre-fix, buckets.clear() would have reset it to a fresh window).
   flood(300, 1_000_002, '11');
   assert.equal(rateLimit(active, { name, windowMs: W, max }, 1_000_003).ok, false, 'active client stays limited across the flood');
+  // Non-vacuity: the cap WAS crossed and LRU evicted the oldest idle key, so
+  // at max 1 that key starts a fresh window (a surviving one is on hit two).
+  const oldest = eventWith({ headers: { 'x-nf-client-connection-ip': '10.0.0.0' } });
+  assert.equal(rateLimit(oldest, { name, windowMs: W, max: 1 }, 1_000_003).ok, true, 'the cap was crossed and LRU evicted the oldest idle key');
 });
 
 test('rateLimit validates the IP (no junk-header bucket minting / poisoning)', () => {
