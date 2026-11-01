@@ -1,6 +1,6 @@
 // Cross-file invariants of THIS repository: pairs whose two halves live in
 // different files, which MAINTENANCE.md held as prose until 2026-09-22. Prose
-// did not hold them — when they were written down, the weekly bump was
+// did not hold them — when they were written down, the monthly bump was
 // validating a bumped tree with two of the three commands a pull request
 // runs, and the README described a test command that skipped a whole suite.
 //
@@ -54,7 +54,7 @@ function workflowInput(file, key) {
   return block;
 }
 
-test('the weekly bump validates a bumped tree with exactly the commands CI runs on a pull request', () => {
+test('the monthly bump validates a bumped tree with exactly the commands CI runs on a pull request', () => {
   // kit-pin-bump.yml's check step is the ONLY gate a bump gets: a PR opened
   // with the default token fires no pull_request run. When the two lists
   // diverged, a bump skipped `npm run lint` that every PR had to pass.

@@ -21,8 +21,8 @@ jobs:
     with:
       verify-kit-pins: true
       # `npm ci`, not family-ci's default `npm install`: package-lock.json is
-      # committed and the weekly bump installs with `npm ci`, so a lockfile out
-      # of step with package.json would be a green PR and a red Monday.
+      # committed and the monthly bump installs with `npm ci`, so a lockfile out
+      # of step with package.json would be a green PR and a red bump.
       install-command: npm ci
       # `dependencies` is not empty: @jfs/vendor-cli sits there on purpose
       # (bin/vendor.mjs resolves it from inside this package) and pulls esbuild
