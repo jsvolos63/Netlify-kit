@@ -255,6 +255,6 @@ CLI over this kit's own source (esm — full and `--pick`-narrowed — global an
 cjs, with every refusal matched on its stderr reason), and `test-repo.mjs`
 holds this repository's cross-file invariants (every export documented here
 and imported by the suite, the shipped `files` under CI's version guard, the
-weekly bump running the same checks as a pull request). The suite needs no
+monthly bump running the same checks as a pull request). The suite needs no
 network access: the guarded fetch's DNS half is answered from a table, and
 the one real-resolver case looks up `localhost`.
