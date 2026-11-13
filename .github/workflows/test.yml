@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   family-ci:
-    uses: jsvolos63/vendor-cli/.github/workflows/family-ci.yml@db95254ec47c7916a7bf8a441bf1f0a36a1a0265 # scratch: FAM-2 pin proof
+    uses: jsvolos63/vendor-cli/.github/workflows/family-ci.yml@09e794fddccaf9695d4ebcb1787e5ba6d0f87201 # scratch: FAM-2 pin proof
     with:
       verify-kit-pins: true
       # `npm ci`, not family-ci's default `npm install`: package-lock.json is
