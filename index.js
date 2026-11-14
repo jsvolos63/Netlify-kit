@@ -52,11 +52,51 @@ export const corsHeaders = {
   'X-Content-Type-Options': 'nosniff',
 };
 
+// ──────────────────────── API response headers ───────────────────────
+//
+// Netlify applies netlify.toml's [[headers]] to the files it serves itself,
+// never to a function's response (FAM-6), so whatever a function does not set
+// it does not send. These three ride on EVERY response this kit builds —
+// every responder, every createHandler short-circuit (preflight, 405, 413,
+// 414, 429, 500), whatever a createHandler `handle` returns, and every answer
+// toWebHandler sends (NK-6, 0.11.0). On a JSON / text / XML API answer:
+//   - nosniff: the body is never re-typed as script, style or HTML;
+//   - the CSP: if the body is ever opened as a document (a link straight to
+//     the endpoint, an upstream that relayed HTML), it runs nothing, loads
+//     nothing and cannot be framed — `sandbox` is what carries the load, since
+//     an XHTML-namespaced body runs script under an XML type alone;
+//   - no-referrer: such a document leaks no URL onward.
+// A header the response already carries is NEVER overwritten (compared
+// case-insensitively), so a function that sets its own CSP — or serves a page
+// on purpose — stays the authority on its own response. CORS is not touched.
+// Ported from JFS-Sports' lib/response-headers.mjs (JFS-12), which measured
+// the gap: every kit error carried nosniff, no kit 200 did.
+
+export const API_RESPONSE_HEADERS = Object.freeze({
+  'X-Content-Type-Options': 'nosniff',
+  'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'; sandbox",
+  'Referrer-Policy': 'no-referrer',
+});
+
+/** A Lambda-shaped response (`{ statusCode, headers, body }`) with
+ *  API_RESPONSE_HEADERS added where absent (case-insensitive; never
+ *  overwrites). Returns a NEW object; anything that is not an object is
+ *  returned untouched. */
+export function addApiHeaders(response) {
+  if (!response || typeof response !== 'object') return response;
+  const headers = { ...(response.headers && typeof response.headers === 'object' ? response.headers : {}) };
+  const present = new Set(Object.keys(headers).map((k) => k.toLowerCase()));
+  for (const [k, v] of Object.entries(API_RESPONSE_HEADERS)) {
+    if (!present.has(k.toLowerCase())) headers[k] = v;
+  }
+  return { ...response, headers };
+}
+
 /** Returns a 204 preflight response for an OPTIONS request, or null otherwise.
  *  The 204 already carries the CORS headers. (market-monitor form.) */
 export function handlePreflight(event) {
   if (event && event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: { ...corsHeaders }, body: '' };
+    return addApiHeaders({ statusCode: 204, headers: { ...corsHeaders }, body: '' });
   }
   return null;
 }
@@ -70,7 +110,7 @@ export function preflightResponse(opts) {
   const allowHeaders = typeof o.allowHeaders === 'string' ? o.allowHeaders : 'content-type';
   const maxAge = typeof o.maxAge === 'string' ? o.maxAge : '86400';
   const corsOrigin = typeof o.corsOrigin === 'string' ? o.corsOrigin : '*';
-  return {
+  return addApiHeaders({
     statusCode: 204,
     headers: {
       'access-control-allow-origin': corsOrigin,
@@ -79,7 +119,7 @@ export function preflightResponse(opts) {
       'access-control-max-age': maxAge,
     },
     body: '',
-  };
+  });
 }
 
 // ─────────────────────────── responses ──────────────────────────
@@ -129,11 +169,11 @@ function bodyFirstJson(body, cacheControl, extraHeaders, cors = true) {
   const headers = { ...jsonHeadersFor(cors) };
   if (cacheControl) headers['Cache-Control'] = cacheControl;
   if (extraHeaders) mergeHeadersInto(headers, extraHeaders);
-  return {
+  return addApiHeaders({
     statusCode: 200,
     headers,
     body: typeof body === 'string' ? body : JSON.stringify(body),
-  };
+  });
 }
 
 /** Surf-Tracker form: `jsonStatusResponse(statusCode, obj, opts?)` → an
@@ -159,11 +199,11 @@ function statusFirstJson(statusCode, obj, opts, cors = true) {
     out['Access-Control-Allow-Origin'] = typeof o.corsOrigin === 'string' ? o.corsOrigin : '*';
   }
   mergeHeadersInto(out, headers);
-  return {
+  return addApiHeaders({
     statusCode,
     headers: out,
     body: JSON.stringify(obj),
-  };
+  });
 }
 
 /** JSON response — a DELEGATING OVERLOAD kept for the original adopters' call
@@ -186,11 +226,11 @@ function _errorResponse(statusCode, error, extraHeaders, cors = true) {
   // constant, and a caller adding one header to a returned 429 must not
   // rewrite every later response in the warm container.
   const base = { ...jsonHeadersFor(cors) };
-  return {
+  return addApiHeaders({
     statusCode,
     headers: extraHeaders ? mergeHeadersInto(base, extraHeaders) : base,
     body: JSON.stringify({ error }),
-  };
+  });
 }
 
 /** Standard JSON error: `{ error }` body with CORS + content-type + nosniff.
@@ -208,7 +248,7 @@ function _textResponse(statusCode, body, opts, cors = true) {
   }
   Object.assign(out, headers);
   if (typeof o.cacheControl === 'string') out['cache-control'] = o.cacheControl;
-  return { statusCode, headers: out, body: body == null ? '' : String(body) };
+  return addApiHeaders({ statusCode, headers: out, body: body == null ? '' : String(body) });
 }
 
 /** Plain-text response, `textResponse(statusCode, body, opts?)` (Surf-Tracker
@@ -278,15 +318,20 @@ export const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 /** Cheap pre-read guard: if an upstream advertises a `content-length` over the
  *  cap, return a 502 response object; otherwise null. content-length may be
  *  absent (chunked) — then this passes and `readTextCapped` is the backstop.
- *  `checkResponseSize(response, headers?)` (market-monitor form). */
+ *  `checkResponseSize(response, headers?)` (market-monitor form).
+ *
+ *  NOT A CAP ON ITS OWN (FAM-8). A chunked upstream sends no content-length,
+ *  so this passes it, and a following `response.text()` / `.json()` buffers
+ *  the whole body, however large. Read the body with `readTextCapped` /
+ *  `readJsonCapped`, which count the bytes as they arrive. */
 export function checkResponseSize(response, headers) {
   const cl = response?.headers?.get?.('content-length');
   if (cl && Number(cl) > MAX_RESPONSE_BYTES) {
-    return {
+    return addApiHeaders({
       statusCode: 502,
       headers: { ...(headers || {}) },
       body: JSON.stringify({ error: 'Upstream response too large' }),
-    };
+    });
   }
   return null;
 }
@@ -294,8 +339,17 @@ export function checkResponseSize(response, headers) {
 /** Read a fetch Response body as UTF-8 text, refusing to buffer more than
  *  `maxBytes`. Streams the body and aborts the moment it exceeds the cap. A
  *  too-large body throws an Error tagged `.tooLarge = true` so callers can
- *  treat it as a hard, non-retryable failure. */
-export async function readTextCapped(res, maxBytes) {
+ *  treat it as a hard, non-retryable failure.
+ *
+ *  `maxBytes` defaults to MAX_RESPONSE_BYTES (5 MB) when omitted. Until 0.11.0
+ *  an omitted cap compared every chunk against `undefined` — never true — so
+ *  `readTextCapped(res)` read an unbounded body while reading like a capped
+ *  one (FAM-8). A cap that is not a non-negative finite number throws a
+ *  TypeError rather than silently meaning "no cap". */
+export async function readTextCapped(res, maxBytes = MAX_RESPONSE_BYTES) {
+  if (typeof maxBytes !== 'number' || !Number.isFinite(maxBytes) || maxBytes < 0) {
+    throw new TypeError(`readTextCapped: maxBytes must be a non-negative finite number (got ${String(maxBytes)})`);
+  }
   const tooLarge = () => {
     const e = new Error('Upstream response too large');
     e.tooLarge = true;
@@ -324,6 +378,21 @@ export async function readTextCapped(res, maxBytes) {
     chunks.push(Buffer.from(value));
   }
   return Buffer.concat(chunks).toString('utf8');
+}
+
+/** `readTextCapped` + `JSON.parse`: the capped replacement for
+ *  `response.json()`. A too-large body throws the same `.tooLarge` error; a
+ *  body that is not JSON throws an Error tagged `.notJson = true`, its message
+ *  naming neither the body nor the URL. */
+export async function readJsonCapped(res, maxBytes = MAX_RESPONSE_BYTES) {
+  const text = await readTextCapped(res, maxBytes);
+  try {
+    return JSON.parse(text);
+  } catch {
+    const e = new Error('Upstream response is not JSON');
+    e.notJson = true;
+    throw e;
+  }
 }
 
 // ────────────────────────── validation ──────────────────────────
@@ -530,7 +599,8 @@ export async function assertSafePublicUrl(candidate) {
  *  assertSafePublicUrl. The start URL used to be the caller's to vet, which
  *  made the one URL an attacker actually supplies the only one this function
  *  took on trust; the guard is idempotent, so a caller that already checked
- *  pays one cached DNS lookup rather than carrying the whole contract.
+ *  pays one more DNS lookup (the kit keeps no cache; `dns.lookup` is a fresh
+ *  getaddrinfo unless the host OS caches) rather than carrying the whole contract.
  *  Resolves `{ html, finalUrl }`; throws BEFORE any fetch on an unsafe start
  *  URL, and on non-ok status, redirect loops, oversized bodies, or an unsafe
  *  hop. Never hand the URL to a library that follows redirects itself —
@@ -871,15 +941,15 @@ function checkWindow(name, ip, max, windowMs, now) {
 }
 
 function queryTooLongResponse(cors = true) {
-  return {
+  return addApiHeaders({
     statusCode: 414,
     headers: { 'Content-Type': 'application/json', ...(cors ? corsHeaders : { 'X-Content-Type-Options': 'nosniff' }) },
     body: JSON.stringify({ error: 'Query string too long' }),
-  };
+  });
 }
 
 function tooManyRequestsResponse(retryAfterSeconds, cors = true) {
-  return {
+  return addApiHeaders({
     statusCode: 429,
     headers: {
       'Content-Type': 'application/json',
@@ -887,11 +957,20 @@ function tooManyRequestsResponse(retryAfterSeconds, cors = true) {
       ...(cors ? corsHeaders : { 'X-Content-Type-Options': 'nosniff' }),
     },
     body: JSON.stringify({ error: 'Too many requests' }),
-  };
+  });
 }
 
 /** Returns a 429 / 414 response object if rate-limited or the query string is
- *  oversized, or null if allowed. The response already carries CORS headers
+ *  oversized, or null if allowed.
+ *
+ *  PER-CONTAINER, AND THEREFORE NOT A COST CONTROL (FAM-3). The buckets live in
+ *  this module's memory, one set per warm container, and Netlify spreads
+ *  concurrent requests over containers: measured 2026-09-26, 90 parallel
+ *  requests to a 60/min endpoint drew ZERO 429s, and 45 rapid ones to a 30/min
+ *  endpoint the same. It slows one sequential client and nothing else. For an
+ *  endpoint that spends a key, a quota or money, use the distributed limiter
+ *  (`createHandler({ distributed: true })`, namespaced per endpoint since
+ *  0.11.0) AND a global `spendDailyBudget` on the upstream itself. The response already carries CORS headers
  *  (unless `opts.cors === false` — the no-CORS-endpoint posture, matching
  *  createResponders; previously consumers had to scrub the header off the
  *  kit-shaped 429/414 by hand). Retry-After reflects the actual time left in
@@ -907,19 +986,78 @@ export function checkRateLimit(event, max = 60, windowMs = 60_000, opts = {}) {
 }
 
 // --- market-monitor: checkRateLimitDistributed (Netlify Blobs) ---
+//
+// The Blobs MODULE is imported once per container; the STORE is opened on
+// every call (0.11.0). In a modern (web-Request) function the runtime installs
+// a per-invocation Blobs context — URLs and a short-lived token — before each
+// request, and `getStore()` reads it when it is called. Until 0.11.0 the store
+// was opened once and cached for the life of the container, so a warm modern
+// instance kept the FIRST invocation's token after it lapsed and every later
+// check fell back to the in-memory limiter (Surf-Tracker's CLAUDE.md recorded
+// it as the reason to avoid this limiter). Opening a store is construction
+// only — no request — so doing it per call costs nothing measurable.
 
-let storePromise = null;
-function getRateStore() {
-  if (storePromise) return storePromise;
-  storePromise = (async () => {
+let blobsModulePromise = null;
+function loadBlobs() {
+  if (!blobsModulePromise) {
+    blobsModulePromise = import('@netlify/blobs').catch(() => null);
+  }
+  return blobsModulePromise;
+}
+
+async function openRuntimeStore(name) {
+  const mod = await loadBlobs();
+  if (!mod || typeof mod.getStore !== 'function') return null; // local dev / no package
+  try {
+    return mod.getStore({ name, consistency: 'strong' });
+  } catch {
+    return null; // no runtime context (classic function, tests) → caller falls back
+  }
+}
+
+// A namespace / budget name becomes part of a Blobs key, and a constant one at
+// that: refuse anything that could smuggle a separator or grow without bound.
+const KEY_PART_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+function assertKeyPart(value, what) {
+  if (typeof value !== 'string' || !KEY_PART_RE.test(value)) {
+    throw new TypeError(`${what} must match ${KEY_PART_RE} (got ${JSON.stringify(value)})`);
+  }
+  return value;
+}
+
+/** Compare-and-set increment of a `{ count }` blob. Returns
+ *  `{ result: 'ok' | 'over' | 'error' | 'contended', count }`:
+ *   - 'ok'        the increment was written (count is the new value);
+ *   - 'over'      count + cost would pass max — nothing written;
+ *   - 'error'     the store threw on read or write;
+ *   - 'contended' every attempt lost the race to another writer. */
+async function casIncrement(store, key, { max, cost = 1, expiresAt, retries = 5 }) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    let data;
+    let etag;
     try {
-      const { getStore } = await import('@netlify/blobs');
-      return getStore({ name: 'rate-limits', consistency: 'strong' });
+      const meta = await store.getWithMetadata(key, { type: 'json' });
+      data = (meta && meta.data) || null;
+      etag = (meta && meta.etag) || null;
     } catch {
-      return null; // local dev / missing siteID — caller falls back to in-memory
+      return { result: 'error', count: null };
     }
-  })();
-  return storePromise;
+    const prev = Number.isFinite(data?.count) ? data.count : 0;
+    const count = prev + cost;
+    if (count > max) return { result: 'over', count: prev };
+    const writeOpts = etag ? { onlyIfMatch: etag } : { onlyIfNew: true };
+    let writeRes;
+    try {
+      writeRes = await store.setJSON(key, { count, expiresAt }, writeOpts);
+    } catch {
+      return { result: 'error', count: null };
+    }
+    // Conditional writes report `{ modified: false }` when the precondition
+    // failed — another instance wrote first. Re-read and retry.
+    if (writeRes && writeRes.modified === false) continue;
+    return { result: 'ok', count };
+  }
+  return { result: 'contended', count: null };
 }
 
 /** Async distributed rate-limit check. Returns a 429 / 414 response object, or
@@ -936,76 +1074,98 @@ function getRateStore() {
  *  heavy the endpoint is exactly what the limiter is meant to protect.
  *
  *  opts:
+ *   - namespace  {string}  the bucket's name (`[A-Za-z0-9_.-]{1,64}`). Without
+ *     one the key is `rl:${ip}:${window}` — the SAME bucket for every endpoint
+ *     on the site that omits it, so one endpoint's traffic spends the others'
+ *     budget (NK-5). With one it is `rl:${namespace}:${ip}:${window}`.
+ *     createHandler passes its `name`. Omitted → the old shared key, unchanged,
+ *     for callers that share a bucket on purpose.
  *   - failClosed {boolean} default false. A read/store error normally falls
  *     back to the in-memory limiter (previous behavior); when true it denies.
  *     Write-conflict exhaustion ALWAYS denies regardless of this flag.
  *   - retries    {number}  CAS retry budget (default 5).
  *   - cors       {boolean} default true. false → the 429/414 shapes carry no
  *     Access-Control-* headers (matches checkRateLimit / createResponders).
- *   - store      {object}  test seam: inject a Blobs-shaped store. */
+ *   - store      {object}  inject a Blobs-shaped store (FlightCheck opens its
+ *     own per invocation; tests). */
 export async function checkRateLimitDistributed(event, max = 60, windowMs = 60_000, opts = {}) {
-  const { failClosed = false, retries = 5, cors = true, store: injectedStore = null } = opts || {};
+  const { failClosed = false, retries = 5, cors = true, store: injectedStore = null, namespace } = opts || {};
+  const ns = namespace === undefined || namespace === null ? null : assertKeyPart(namespace, 'checkRateLimitDistributed: namespace');
   const qs = event.rawQuery || event.rawQueryString || '';
   if (typeof qs === 'string' && qs.length > MAX_QUERY_LENGTH) {
     return queryTooLongResponse(cors);
   }
 
-  const store = injectedStore || await getRateStore();
+  const store = injectedStore || await openRuntimeStore('rate-limits');
   if (!store) return checkRateLimit(event, max, windowMs, { cors });
 
   const ip = extractIp(event);
   const now = Date.now();
   const windowStart = Math.floor(now / windowMs) * windowMs;
-  const key = `rl:${ip}:${windowStart}`;
+  const prefix = ns ? `rl:${ns}:${ip}` : `rl:${ip}`;
+  const key = `${prefix}:${windowStart}`;
   const denied = () =>
     tooManyRequestsResponse(Math.max(1, Math.ceil((windowStart + windowMs - now) / 1000)), cors);
 
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    let data;
-    let etag;
-    try {
-      const meta = await store.getWithMetadata(key, { type: 'json' });
-      data = (meta && meta.data) || null;
-      etag = (meta && meta.etag) || null;
-    } catch {
-      // Read/store failure: fall back to the in-memory limiter (default), or
-      // deny when the caller asked to fail closed.
-      return failClosed ? denied() : checkRateLimit(event, max, windowMs, { cors });
-    }
-
-    const count = (data?.count || 0) + 1;
-    if (count > max) return denied();
-
-    const val = { count, expiresAt: windowStart + windowMs * 2 };
-    const writeOpts = etag ? { onlyIfMatch: etag } : { onlyIfNew: true };
-    let writeRes;
-    try {
-      writeRes = await store.setJSON(key, val, writeOpts);
-    } catch {
-      // A thrown write (network/store outage, not a CAS conflict) means we can't
-      // persist the increment. Mirror the read-error path: fall back to the
-      // in-memory limiter (still throttles per-instance) by default, or deny when
-      // the caller asked to fail closed — never blanket-allow, which would let a
-      // write-only Blobs degradation bypass the limit entirely.
-      return failClosed ? denied() : checkRateLimit(event, max, windowMs, { cors });
-    }
-
-    // Conditional writes report `{ modified: false }` when the precondition
-    // failed — i.e. another instance wrote first. Re-read and retry.
-    if (writeRes && writeRes.modified === false) continue;
-
-    // Success. Best-effort delete the previous window's key so idle buckets
-    // don't accumulate unbounded in the store.
-    try { await store.delete(`rl:${ip}:${windowStart - windowMs}`); } catch { /* best effort */ }
-    return null;
+  const { result } = await casIncrement(store, key, { max, expiresAt: windowStart + windowMs * 2, retries });
+  if (result === 'over' || result === 'contended') return denied();
+  if (result === 'error') {
+    // Read or write failure: fall back to the in-memory limiter (still
+    // throttles per-instance) by default, or deny when the caller asked to
+    // fail closed — never blanket-allow, which would let a Blobs degradation
+    // bypass the limit entirely.
+    return failClosed ? denied() : checkRateLimit(event, max, windowMs, { cors });
   }
-
-  // Every attempt lost the CAS race — persistent contention. Fail closed.
-  return denied();
+  // Success. Best-effort delete the previous window's key so idle buckets
+  // don't accumulate unbounded in the store.
+  try { await store.delete(`${prefix}:${windowStart - windowMs}`); } catch { /* best effort */ }
+  return null;
 }
 
-/** Test seam: reset the cached Blobs store promise so tests can stub it. */
-export function _resetStoreCache() { storePromise = null; }
+/** Test seam: forget the cached `@netlify/blobs` import so a test can stub it.
+ *  (The store itself is no longer cached — see openRuntimeStore.) */
+export function _resetStoreCache() { blobsModulePromise = null; }
+
+/** Test seam: stand in for `@netlify/blobs` (an object with `getStore`). */
+export function _setBlobsModuleForTest(mod) { blobsModulePromise = Promise.resolve(mod); }
+
+// ───────────────────────── daily upstream budgets ─────────────────────────
+//
+// A per-IP limiter bounds one caller; it does not bound the bill. A billed or
+// keyed upstream also needs a GLOBAL ceiling — N calls per UTC day across every
+// caller — so a client spread over many IPs (or many containers, FAM-3) still
+// cannot spend past it. market-monitor's snapshot trigger (`evaluateDailyCap`)
+// is the pattern; this is that counter on the limiter's compare-and-set.
+
+/** Spend `cost` (default 1) from the named daily budget. Resolves to
+ *  `{ ok, used, max, resetAt }`: `ok: false` once the day's spend would pass
+ *  `max` (nothing is charged then), `resetAt` the epoch ms of the next UTC
+ *  midnight. Keyed `budget:${name}:${YYYY-MM-DD}` in the `rate-limits` store
+ *  (or `opts.store`), so every container and every caller shares one count.
+ *
+ *  FAILS CLOSED by default: a store that cannot be opened, read or written
+ *  answers `ok: false, reason: 'unavailable'` — a budget exists to stop
+ *  spending, and a Blobs outage must not open the tap. `failOpen: true` is for
+ *  a caller that would rather serve than protect the quota.
+ *
+ *  opts: { now, cost, store, failOpen, retries } */
+export async function spendDailyBudget(name, max, opts = {}) {
+  assertKeyPart(name, 'spendDailyBudget: name');
+  if (!Number.isInteger(max) || max < 0) throw new TypeError(`spendDailyBudget: max must be a non-negative integer (got ${String(max)})`);
+  const { now = Date.now(), cost = 1, store: injectedStore = null, failOpen = false, retries = 5 } = opts || {};
+  if (!Number.isInteger(cost) || cost < 1) throw new TypeError(`spendDailyBudget: cost must be a positive integer (got ${String(cost)})`);
+  const day = new Date(now).toISOString().slice(0, 10);
+  const resetAt = Date.parse(`${day}T00:00:00.000Z`) + 86_400_000;
+  const unavailable = () => ({ ok: failOpen, used: null, max, resetAt, reason: 'unavailable' });
+
+  const store = injectedStore || await openRuntimeStore('rate-limits');
+  if (!store) return unavailable();
+  const { result, count } = await casIncrement(store, `budget:${name}:${day}`, { max, cost, expiresAt: resetAt + 86_400_000, retries });
+  if (result === 'ok') return { ok: true, used: count, max, resetAt };
+  if (result === 'over') return { ok: false, used: count, max, resetAt, reason: 'exhausted' };
+  if (result === 'contended') return { ok: false, used: null, max, resetAt, reason: 'contended' };
+  return unavailable();
+}
 
 // --- Surf-Tracker form: rateLimit (per-name buckets, returns { ok, retryAfter }) ---
 
@@ -1129,7 +1289,8 @@ export async function setTTLCached(store, key, data, { now = Date.now() } = {}) 
 // ─────────────────────── handler factory ────────────────────────
 //
 // Wraps the cross-cutting concerns every function needs — CORS preflight,
-// per-IP rate limiting, top-level try/catch + 500 fallback.
+// per-IP rate limiting, top-level try/catch + 500 fallback, and (0.11.0) the
+// API response headers on whatever the handler returns.
 
 /** Measure `event.body` in BYTES, decoding first when the platform
  *  base64-transported it — a binary upload's base64 string is ~4/3 the size of
@@ -1157,9 +1318,20 @@ function _bodyByteLength(event) {
  *                     is refused with a 413 before `handle` runs, so a handler
  *                     never JSON.parses an unbounded string. Base64-transported
  *                     bodies are measured decoded. Omitted → uncapped.
- *   - `rateLimit`   — `{ max, windowMs }` (default 60 / 60 s); `null`/`false`
- *                     disables the limiter.
- *   - `distributed` — when true, uses the Blobs-backed limiter.
+ *   - `rateLimit`   — `{ max, windowMs, namespace? }` (default 60 / 60 s);
+ *                     `null`/`false` disables the limiter. The default
+ *                     in-memory limiter is per container and does not stop a
+ *                     parallel client (FAM-3, measured: zero 429s at 90
+ *                     parallel requests to a 60/min endpoint) — see
+ *                     `distributed`.
+ *   - `distributed` — when true, uses the Blobs-backed limiter, which counts
+ *                     across every container. Its bucket is namespaced by
+ *                     `rateLimit.namespace`, else by `name` (NK-5, 0.11.0):
+ *                     two endpoints with different names no longer spend one
+ *                     bucket. Give endpoints the SAME namespace to share one
+ *                     on purpose. `name` must then be a valid key part
+ *                     (`[A-Za-z0-9_.-]{1,64}`), checked when the handler is
+ *                     built. Pair a billed upstream with `spendDailyBudget`.
  *   - `cors`        — default true. `false` → NONE of the responses this
  *                     wrapper itself emits carry Access-Control-* headers:
  *                     the OPTIONS short-circuit becomes a bare 204, the 405,
@@ -1167,7 +1339,9 @@ function _bodyByteLength(event) {
  *                     the no-CORS shapes (pair with
  *                     `createResponders({ cors: false })` inside `handle` for a
  *                     fully CORS-free endpoint).
- *   - `handle`      — `async (event) => responseObject`. Required.
+ *   - `handle`      — `async (event) => responseObject`. Required. Its
+ *                     response gets API_RESPONSE_HEADERS added where absent
+ *                     (never overwriting a header it set).
  *   - `onError`     — `async (error, event) => responseObject`. Optional. */
 export function createHandler(options) {
   const {
@@ -1193,16 +1367,19 @@ export function createHandler(options) {
   const bodyCap = Number.isFinite(maxBodyBytes) && maxBodyBytes >= 0 ? maxBodyBytes : null;
 
   const limiterEnabled = rateLimitOpt !== null && rateLimitOpt !== false;
+  const namespace = limiterEnabled && distributed
+    ? assertKeyPart(rateLimitOpt.namespace ?? name, 'createHandler: rateLimit.namespace (or name)')
+    : null;
   const limit = limiterEnabled
     ? (distributed
-        ? (event) => checkRateLimitDistributed(event, rateLimitOpt.max, rateLimitOpt.windowMs, { cors })
+        ? (event) => checkRateLimitDistributed(event, rateLimitOpt.max, rateLimitOpt.windowMs, { cors, namespace })
         : (event) => checkRateLimit(event, rateLimitOpt.max, rateLimitOpt.windowMs, { cors }))
     : null;
 
   return async (event, context) => {
     const preflight = cors
       ? handlePreflight(event)
-      : (event && event.httpMethod === 'OPTIONS' ? { statusCode: 204, headers: {}, body: '' } : null);
+      : (event && event.httpMethod === 'OPTIONS' ? addApiHeaders({ statusCode: 204, headers: {}, body: '' }) : null);
     if (preflight) return preflight;
 
     if (allowed) {
@@ -1222,11 +1399,11 @@ export function createHandler(options) {
     }
 
     try {
-      return await handle(event, context);
+      return addApiHeaders(await handle(event, context));
     } catch (error) {
       if (onError) {
         try {
-          return await onError(error, event);
+          return addApiHeaders(await onError(error, event));
         } catch (innerErr) {
           console.error(`${name} onError threw:`, errorMessage(innerErr));
         }
@@ -1234,6 +1411,136 @@ export function createHandler(options) {
       console.error(`${name} error:`, errorMessage(error));
       return _errorResponse(500, 'Internal error', undefined, cors);
     }
+  };
+}
+
+// ───────────────────── modern (web-Request) functions ─────────────────────
+//
+// `toWebHandler(handler)` serves a Lambda-shaped handler — createHandler's, or
+// any `(event, context) => { statusCode, headers, body }` — as a MODERN
+// Netlify function's default export: `export default toWebHandler(handler)`.
+//
+// Why a family repo wants that: only a modern function gets a per-invocation
+// Blobs context (the distributed limiter, spendDailyBudget and every store
+// work; a classic handler's `getStore()` throws), and Netlify reads a
+// function's edge rate limit (`export const config`) only from a modern one.
+// Five consumers had each grown their own adapter (FlightCheck, Surf-Tracker,
+// John's News `toV2`, market-monitor `utils/web.mjs`, JFS-Sports
+// `lib/web-handler.mjs`), and they had drifted on the one property that
+// matters to a limiter: JFS-Sports' kept a caller-sent
+// `x-nf-client-connection-ip`. This is FlightCheck's, which has run in
+// production since 2026-09-23, with the kit's headers on every answer.
+//
+// What it guarantees:
+//   - the client IP the limiter keys on is the RUNTIME's (`context.ip`); a
+//     caller-sent `x-nf-client-connection-ip` is deleted first, so rotating it
+//     cannot mint fresh buckets (NK-2); with no context.ip the kit's last-hop
+//     `x-forwarded-for` rule decides;
+//   - query and header maps are built with Object.fromEntries, so
+//     `?constructor=1` or a header named `__proto__` is data, never a lookup
+//     on Object.prototype (FlightCheck answered a 502 with its stack trace for
+//     `weather?constructor=1` before this);
+//   - a repeated query key reads as its values joined by `, ` in
+//     `queryStringParameters` (last-wins would let `id=!!&id=ok` slip a valid
+//     value past validation), every value in `multiValueQueryStringParameters`;
+//   - `rawQuery` is filled, so the limiter's 414 guard can fire;
+//   - a binary request body arrives base64-encoded, as the classic runtime
+//     delivered it;
+//   - a throw — the handler's or the adapter's — answers a bare
+//     `500 {"error":"Internal error"}` with `no-store`, and the error is
+//     logged, never sent (the runtime's own answer is a 502 carrying a trace);
+//   - HEAD and null-body statuses (101/204/205/304) send no body;
+//   - every answer carries API_RESPONSE_HEADERS where the handler set none.
+//
+// opts: { cors } (default true) — whether the adapter's own 500 carries the
+// family CORS header, matching createHandler's option of the same name.
+
+const WEB_BINARY_TYPE = /image|audio|video|application\/pdf|application\/zip|application\/octet-stream/i;
+const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
+
+/** The classic event a Lambda-shaped handler expects, built from a web
+ *  Request and the modern runtime's `context`. */
+export async function toLambdaEvent(request, context) {
+  const url = new URL(request.url);
+  const headers = Object.fromEntries(request.headers);
+  delete headers['x-nf-client-connection-ip'];
+  if (context && typeof context.ip === 'string' && context.ip) {
+    headers['x-nf-client-connection-ip'] = context.ip;
+  }
+  if (!headers.host) headers.host = url.host;
+  const multiValueHeaders = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k, [v]]));
+
+  const grouped = new Map();
+  for (const [k, v] of url.searchParams) {
+    const list = grouped.get(k);
+    if (list) list.push(v);
+    else grouped.set(k, [v]);
+  }
+  const queryStringParameters = Object.fromEntries([...grouped].map(([k, vs]) => [k, vs.join(', ')]));
+  const multiValueQueryStringParameters = Object.fromEntries(grouped);
+
+  let body = null;
+  let isBase64Encoded = false;
+  if (request.method !== 'GET' && request.method !== 'HEAD' && request.body != null) {
+    const bytes = Buffer.from(await request.arrayBuffer());
+    if (bytes.length > 0) {
+      if (WEB_BINARY_TYPE.test(request.headers.get('content-type') || '')) {
+        body = bytes.toString('base64');
+        isBase64Encoded = true;
+      } else {
+        body = bytes.toString('utf8');
+      }
+    }
+  }
+
+  return {
+    httpMethod: request.method,
+    path: url.pathname,
+    rawUrl: request.url,
+    rawQuery: url.search.slice(1),
+    headers,
+    multiValueHeaders,
+    queryStringParameters,
+    multiValueQueryStringParameters,
+    body,
+    isBase64Encoded,
+  };
+}
+
+/** The web Response for a Lambda-shaped result, with API_RESPONSE_HEADERS
+ *  added where absent. `multiValueHeaders` win over `headers` for a name. */
+export function toWebResponse(result, method) {
+  const r = addApiHeaders(result && typeof result === 'object' ? result : { statusCode: 500, body: '' });
+  const status = Number.isInteger(r.statusCode) ? r.statusCode : 200;
+  const headers = new Headers();
+  for (const [k, v] of Object.entries(r.headers || {})) {
+    if (v != null) headers.set(k, String(v));
+  }
+  for (const [k, vs] of Object.entries(r.multiValueHeaders || {})) {
+    if (!Array.isArray(vs)) continue;
+    headers.delete(k);
+    for (const v of vs) if (v != null) headers.append(k, String(v));
+  }
+  let body = null;
+  if (method !== 'HEAD' && !NULL_BODY_STATUS.has(status) && r.body != null) {
+    body = r.isBase64Encoded ? Buffer.from(String(r.body), 'base64') : String(r.body);
+  }
+  return new Response(body, { status, headers });
+}
+
+/** Serve a Lambda-shaped handler as a modern function's default export. */
+export function toWebHandler(handler, opts) {
+  if (typeof handler !== 'function') throw new TypeError('toWebHandler: expected a handler function');
+  const cors = !(opts && opts.cors === false);
+  return async (request, context) => {
+    let result;
+    try {
+      result = await handler(await toLambdaEvent(request, context), context || {});
+    } catch (err) {
+      console.error('toWebHandler: unhandled error:', errorMessage(err));
+      result = _errorResponse(500, 'Internal error', { 'Cache-Control': 'no-store' }, cors);
+    }
+    return toWebResponse(result, request.method);
   };
 }
 

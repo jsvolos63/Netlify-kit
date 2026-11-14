@@ -32,9 +32,7 @@ picks them up on a pin bump and can't see the diff.
   is idempotent, so a caller that already checked pays one more DNS lookup —
   not a "cached" one, as this note and the function's own comment used to say:
   the kit keeps no cache, and `dns.lookup` is a fresh `getaddrinfo` unless the
-  host OS caches. (The comment in `index.js` still says "cached"; fix it with
-  the next change that bumps the version, not on its own — a comment is not
-  worth re-vendoring eight consumers for.)
+  host OS caches. (Fixed in 0.11.0: `index.js` used to call that lookup "cached".)
   The call sits BEFORE the AbortController, so a refusal leaves no timer behind.
   The suite drives both halves of that guard through a table-backed
   `dns.lookup` (`withDns` in `test.mjs`), so it needs no network — and the
@@ -74,6 +72,24 @@ first, and the WHATWG parser normalizes every numeric host form it accepts to
 dotted-decimal (`127.1` → `127.0.0.1`, caught by the dotted-quad regex) and
 refuses the rest (`foo.123` → `invalid-url`). A test pins that behaviour,
 since it belongs to the URL parser rather than to anything in this file.
+
+## What 0.11.0 added, and the two choices not to undo
+
+The family hardening pass of 2026-11-14 (MAINTENANCE.md's audit table: NK-2,
+NK-5, NK-6, FAM-3, FAM-8). `API_RESPONSE_HEADERS` rides on every shape the kit
+builds and on whatever a `createHandler` / `toWebHandler` handler returns;
+`checkRateLimitDistributed` takes a `namespace` and `createHandler` passes its
+`name`; `readTextCapped` caps at 5 MB when no cap is given; `spendDailyBudget`
+is a global per-day ceiling; `toWebHandler` is the one Request→event adapter.
+
+- **Headers are added, never overwritten.** `addApiHeaders` compares names
+  case-insensitively and leaves any header the response already has. A relay
+  that sets its own CSP, or a function that deliberately serves a page, keeps
+  its own. Overwriting would silently break the first consumer that does.
+- **The distributed limiter is NOT the default.** It is a Blobs read and a
+  conditional write per request, and the kit reaches eight apps through an
+  unreviewed monthly bump; each app opts its billed endpoints in. The
+  in-memory limiter's JSDoc says why it is not a cost control (FAM-3).
 
 ## Lint
 

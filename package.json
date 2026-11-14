@@ -1,7 +1,7 @@
 {
   "name": "@jfs/netlify-kit",
-  "version": "0.10.0",
-  "description": "Shared, dependency-free Netlify Functions primitives (CORS + preflight, JSON/text/error responses, capped request and response body reads, input validation, SSRF guards, retry-with-backoff fetch, per-IP rate limiting, a Blobs store opener + short-TTL cache, a createHandler boundary, and a hardened Anthropic (Claude) Messages-API client) extracted from the JFS family of buildless static sites.",
+  "version": "0.11.0",
+  "description": "Shared, dependency-free Netlify Functions primitives (CORS + preflight, JSON/text/error responses with API security headers on every shape, capped request and response body reads, input validation, SSRF guards, retry-with-backoff fetch, per-IP rate limiting (namespaced distributed buckets), global daily upstream budgets, a modern web-Request handler adapter, a Blobs store opener + short-TTL cache, a createHandler boundary, and a hardened Anthropic (Claude) Messages-API client) extracted from the JFS family of buildless static sites.",
   "type": "module",
   "license": "MIT",
   "author": "jsvolos63",
@@ -49,5 +49,8 @@
     "@eslint/js": "^10.0.1",
     "eslint": "^10.13.0",
     "globals": "^17.13.0"
+  },
+  "overrides": {
+    "minimatch": "^11.0.5"
   }
 }
