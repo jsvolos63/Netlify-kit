@@ -25,7 +25,15 @@ import {
   errorMessage,
   checkResponseSize,
   readTextCapped,
+  readJsonCapped,
   MAX_RESPONSE_BYTES,
+  API_RESPONSE_HEADERS,
+  addApiHeaders,
+  spendDailyBudget,
+  toWebHandler,
+  toLambdaEvent,
+  toWebResponse,
+  _setBlobsModuleForTest,
   SYMBOL_RE,
   FRED_ID_RE,
   UNIX_TS_RE,
@@ -149,11 +157,18 @@ test('json response header shapes are pinned (both branches, exact)', () => {
     'X-Content-Type-Options': 'nosniff',
     // NOTE: no Cache-Control — body-first never emits one unless asked
     // (consumers rely on that for CDN-cacheable proxies).
+    // 0.11.0 (NK-6): the API headers ride on every shape.
+    'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'; sandbox",
+    'Referrer-Policy': 'no-referrer',
   });
   assert.deepEqual(jsonStatusResponse(404, { error: 'nope' }).headers, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store', // status-first defaults to no-store
     'Access-Control-Allow-Origin': '*',
+    // 0.11.0 (NK-6): nosniff was missing here before, and so were the others.
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'; sandbox",
+    'Referrer-Policy': 'no-referrer',
   });
 });
 
@@ -1013,11 +1028,12 @@ test('createHandler({ cors: false }): preflight, 429, and 500 all emit zero CORS
   _resetRateLimit();
   const responders = createResponders({ cors: false });
 
-  // OPTIONS short-circuit becomes a bare 204.
+  // OPTIONS short-circuit becomes a 204 with no CORS header (0.11.0: the API
+  // headers only — NK-6 puts them on every shape).
   const bare = createHandler({ cors: false, handle: async () => responders.ok({}) });
   const pf = await bare(eventWith({ method: 'OPTIONS' }));
   assert.equal(pf.statusCode, 204);
-  assert.deepEqual(pf.headers, {});
+  assert.deepEqual(pf.headers, { ...API_RESPONSE_HEADERS });
 
   // The limiter's 429 honors the opt-out.
   const limited = createHandler({ cors: false, rateLimit: { max: 1, windowMs: 60_000 }, handle: async () => responders.ok({}) });
@@ -1734,4 +1750,253 @@ test('raceProxyHtml: a proxy error status is a rejection for that proxy only', a
     const got = await raceProxyHtml('https://pub.example/story', proxies, async (html) => ({ content: html }));
     assert.match(got.content, /real/);
   });
+});
+
+
+// ═══════════════════════ 0.11.0: the family hardening pass ═══════════════════════
+//
+// Each test below fails on 0.10.0: run against the previous index.js it either
+// cannot import the name it tests or asserts a property 0.10.0 did not have.
+
+const CSP = "default-src 'none'; frame-ancestors 'none'; sandbox";
+function assertApiHeaders(res, label) {
+  const lower = Object.fromEntries(Object.entries(res.headers || {}).map(([k, v]) => [k.toLowerCase(), v]));
+  assert.equal(lower['x-content-type-options'], 'nosniff', `${label}: nosniff`);
+  assert.equal(lower['content-security-policy'], CSP, `${label}: CSP`);
+  assert.equal(lower['referrer-policy'], 'no-referrer', `${label}: Referrer-Policy`);
+}
+
+test('NK-6: every response shape the kit builds carries the API headers', async () => {
+  _resetRateLimit();
+  const shapes = {
+    handlePreflight: handlePreflight({ httpMethod: 'OPTIONS' }),
+    preflightResponse: preflightResponse(),
+    jsonBodyResponse: jsonBodyResponse({ a: 1 }),
+    jsonStatusResponse: jsonStatusResponse(200, { a: 1 }),
+    'jsonResponse(number)': jsonResponse(201, { a: 1 }),
+    'jsonResponse(body)': jsonResponse({ a: 1 }),
+    errorResponse: errorResponse(400, 'x'),
+    textResponse: textResponse(200, 'hi'),
+    ok: ok({}),
+    badRequest: badRequest('x'),
+    notFound: notFound('x'),
+    methodNotAllowed: methodNotAllowed(),
+    serverError: serverError('x'),
+    badGateway: badGateway('x'),
+    upstreamError: upstreamError(503, 'x'),
+    checkResponseSize: checkResponseSize({ headers: new Headers({ 'content-length': String(MAX_RESPONSE_BYTES + 1) }) }),
+  };
+  for (const cors of [true, false]) {
+    const r = createResponders({ cors });
+    for (const [k, fn] of Object.entries({
+      jsonBodyResponse: () => r.jsonBodyResponse({}), jsonStatusResponse: () => r.jsonStatusResponse(200, {}),
+      textResponse: () => r.textResponse(200, 't'), errorResponse: () => r.errorResponse(500, 'x'), ok: () => r.ok({}),
+    })) shapes[`createResponders(${cors}).${k}`] = fn();
+  }
+  const ev = eventWith({ headers: { 'x-forwarded-for': '7.7.7.7' } });
+  checkRateLimit(ev, 1, 60_000);
+  shapes['checkRateLimit 429'] = checkRateLimit(ev, 1, 60_000);
+  shapes['checkRateLimit 414'] = checkRateLimit(eventWith({ rawQuery: 'x'.repeat(MAX_QUERY_LENGTH + 1) }), 1, 60_000);
+  for (const [label, res] of Object.entries(shapes)) assertApiHeaders(res, label);
+});
+
+test('NK-6: createHandler adds the API headers to whatever handle returns, every short-circuit, never overwriting', async () => {
+  _resetRateLimit();
+  for (const cors of [true, false]) {
+    const handBuilt = createHandler({ cors, rateLimit: { max: 1, windowMs: 60_000 }, methods: ['GET'], maxBodyBytes: 2,
+      handle: async () => ({ statusCode: 200, headers: { 'content-type': 'application/xml' }, body: '<x/>' }) });
+    const ev = (o) => eventWith({ headers: { 'x-forwarded-for': cors ? '6.6.6.1' : '6.6.6.2' }, ...o });
+    assertApiHeaders(await handBuilt(ev({ method: 'OPTIONS' })), `cors=${cors} preflight`);
+    assertApiHeaders(await handBuilt(ev({ method: 'POST' })), `cors=${cors} 405`);
+    assertApiHeaders(await handBuilt(ev({ body: 'toolong' })), `cors=${cors} 413`);
+    _resetRateLimit();
+    assertApiHeaders(await handBuilt(ev({})), `cors=${cors} hand-built 200`);
+    assertApiHeaders(await handBuilt(ev({})), `cors=${cors} 429`);
+    const thrower = createHandler({ cors, rateLimit: null, handle: async () => { throw new Error('boom'); } });
+    assertApiHeaders(await thrower(eventWith({})), `cors=${cors} 500`);
+    const recovered = createHandler({ cors, rateLimit: null, handle: async () => { throw new Error('boom'); },
+      onError: async () => ({ statusCode: 503, headers: {}, body: '' }) });
+    assertApiHeaders(await recovered(eventWith({})), `cors=${cors} onError`);
+  }
+  // A function's own CSP (a relay, a page) stands — compared case-insensitively.
+  const own = createHandler({ rateLimit: null, handle: async () => ({
+    statusCode: 200, headers: { 'content-security-policy': "default-src 'none'; sandbox", 'referrer-policy': 'origin' }, body: '' }) });
+  const res = await own(eventWith({}));
+  assert.equal(res.headers['content-security-policy'], "default-src 'none'; sandbox");
+  assert.equal(res.headers['referrer-policy'], 'origin');
+  assert.ok(!('Content-Security-Policy' in res.headers) && !('Referrer-Policy' in res.headers), 'no duplicate pair');
+  assert.equal(res.headers['X-Content-Type-Options'], 'nosniff');
+  // addApiHeaders leaves non-objects alone and returns a new object.
+  assert.equal(addApiHeaders(null), null);
+  const src = { statusCode: 200, headers: {}, body: '' };
+  assert.notStrictEqual(addApiHeaders(src), src);
+  assert.deepEqual(src.headers, {});
+});
+
+// A ReadableStream body of `total` bytes, in 64 KiB chunks, with no length.
+function chunkedResponse(total) {
+  let sent = 0;
+  const body = new ReadableStream({
+    pull(c) {
+      if (sent >= total) { c.close(); return; }
+      const n = Math.min(65536, total - sent);
+      sent += n;
+      c.enqueue(new Uint8Array(n).fill(0x61));
+    },
+  });
+  return { response: new Response(body), sent: () => sent };
+}
+
+test('FAM-8: readTextCapped with no cap stops at MAX_RESPONSE_BYTES on a chunked body', async () => {
+  const { response, sent } = chunkedResponse(MAX_RESPONSE_BYTES + 3 * 65536);
+  await assert.rejects(readTextCapped(response), (e) => e.tooLarge === true);
+  assert.ok(sent() <= MAX_RESPONSE_BYTES + 65536, `read ${sent()} bytes; the cap must stop the stream`);
+});
+
+test('FAM-8: readTextCapped refuses a cap that is not a non-negative finite number', async () => {
+  for (const bad of [NaN, Infinity, -1, '100', null]) {
+    await assert.rejects(readTextCapped(new Response('x'), bad), TypeError, `cap ${String(bad)}`);
+  }
+  assert.equal(await readTextCapped(new Response('abc'), 3), 'abc');
+});
+
+test('FAM-8: readJsonCapped parses within the cap, tags too-large and not-JSON bodies', async () => {
+  assert.deepEqual(await readJsonCapped(new Response('{"a":1}')), { a: 1 });
+  await assert.rejects(readJsonCapped(new Response('{"a":1}'), 3), (e) => e.tooLarge === true);
+  await assert.rejects(readJsonCapped(new Response('<html>')), (e) => e.notJson === true && !/html/.test(e.message));
+});
+
+test('NK-5: distributed endpoints with different names keep separate buckets', async () => {
+  const store = casStore();
+  _setBlobsModuleForTest({ getStore: () => store });
+  try {
+    const mk = (name) => createHandler({ name, distributed: true, rateLimit: { max: 1, windowMs: 60_000 }, handle: async () => ok({}) });
+    const a = mk('search'); const b = mk('quote');
+    const ev = eventWith({ headers: { 'x-nf-client-connection-ip': '3.3.3.3' } });
+    assert.equal((await a(ev)).statusCode, 200);
+    assert.equal((await b(ev)).statusCode, 200, "a's spend must not deny b");
+    assert.equal((await a(ev)).statusCode, 429);
+    const keys = [...store._map.keys()];
+    assert.ok(keys.some((k) => k.startsWith('rl:search:3.3.3.3:')) && keys.some((k) => k.startsWith('rl:quote:3.3.3.3:')), keys.join(' '));
+    // Sharing on purpose: one namespace, two names.
+    const s1 = createHandler({ name: 'x1', distributed: true, rateLimit: { max: 1, windowMs: 60_000, namespace: 'shared' }, handle: async () => ok({}) });
+    const s2 = createHandler({ name: 'x2', distributed: true, rateLimit: { max: 1, windowMs: 60_000, namespace: 'shared' }, handle: async () => ok({}) });
+    assert.equal((await s1(ev)).statusCode, 200);
+    assert.equal((await s2(ev)).statusCode, 429);
+  } finally { _resetStoreCache(); }
+});
+
+test('NK-5: a direct call without a namespace keeps the 0.10.0 key; a bad namespace or name throws', async () => {
+  const store = casStore();
+  const ev = eventWith({ headers: { 'x-nf-client-connection-ip': '3.3.3.4' } });
+  await checkRateLimitDistributed(ev, 5, 60_000, { store });
+  assert.ok([...store._map.keys()].every((k) => /^rl:3\.3\.3\.4:\d+$/.test(k)));
+  await assert.rejects(checkRateLimitDistributed(ev, 5, 60_000, { store, namespace: 'a:b' }), TypeError);
+  assert.throws(() => createHandler({ name: 'has space', distributed: true, handle: async () => ok({}) }), TypeError);
+  // Not distributed: any name is fine (it is only a log label there).
+  assert.doesNotThrow(() => createHandler({ name: 'has space', handle: async () => ok({}) }));
+});
+
+test('the distributed limiter opens the Blobs store on every call (a warm modern function keeps no stale token)', async () => {
+  let opened = 0;
+  _setBlobsModuleForTest({ getStore: () => { opened += 1; return casStore(); } });
+  try {
+    const ev = eventWith({ headers: { 'x-nf-client-connection-ip': '3.3.3.5' } });
+    await checkRateLimitDistributed(ev, 5, 60_000);
+    await checkRateLimitDistributed(ev, 5, 60_000);
+    assert.equal(opened, 2);
+    // A getStore that throws (a classic function: no runtime context) falls back.
+    _setBlobsModuleForTest({ getStore: () => { throw new Error('MissingBlobsEnvironmentError'); } });
+    assert.equal(await checkRateLimitDistributed(eventWith({ headers: { 'x-nf-client-connection-ip': '3.3.3.6' } }), 5, 60_000), null);
+  } finally { _resetStoreCache(); }
+});
+
+test('spendDailyBudget: charges to max across callers, then refuses; a new UTC day starts fresh', async () => {
+  const store = casStore();
+  const now = Date.parse('2026-11-14T23:59:00Z');
+  for (let i = 1; i <= 3; i++) assert.deepEqual(await spendDailyBudget('aeroapi', 3, { store, now }), { ok: true, used: i, max: 3, resetAt: Date.parse('2026-11-15T00:00:00Z') });
+  const over = await spendDailyBudget('aeroapi', 3, { store, now });
+  assert.equal(over.ok, false); assert.equal(over.reason, 'exhausted'); assert.equal(over.used, 3);
+  assert.equal((await spendDailyBudget('aeroapi', 3, { store, now: now + 120_000 })).ok, true, 'next day');
+  assert.equal((await spendDailyBudget('other', 3, { store, now })).used, 1, 'budgets are separate');
+  assert.equal((await spendDailyBudget('cost', 5, { store, now, cost: 5 })).used, 5);
+  assert.equal((await spendDailyBudget('cost', 5, { store, now })).ok, false);
+});
+
+test('spendDailyBudget: concurrent spends never pass max (compare-and-set)', async () => {
+  const store = casStore();
+  const now = Date.parse('2026-11-14T12:00:00Z');
+  const results = await Promise.all(Array.from({ length: 40 }, () => spendDailyBudget('burst', 10, { store, now, retries: 50 })));
+  assert.equal(results.filter((r) => r.ok).length, 10);
+  assert.equal(store._map.get('budget:burst:2026-11-14').count, 10);
+});
+
+test('spendDailyBudget: fails closed when Blobs is unavailable, open only on request; validates its inputs', async () => {
+  _setBlobsModuleForTest(null);
+  try {
+    assert.deepEqual((await spendDailyBudget('x', 5)).ok, false);
+    assert.equal((await spendDailyBudget('x', 5)).reason, 'unavailable');
+    assert.equal((await spendDailyBudget('x', 5, { failOpen: true })).ok, true);
+  } finally { _resetStoreCache(); }
+  const broken = { getWithMetadata: async () => { throw new Error('down'); }, setJSON: async () => ({}) };
+  assert.equal((await spendDailyBudget('x', 5, { store: broken })).ok, false);
+  await assert.rejects(spendDailyBudget('bad name', 5, { store: casStore() }), TypeError);
+  await assert.rejects(spendDailyBudget('x', -1, { store: casStore() }), TypeError);
+  await assert.rejects(spendDailyBudget('x', 5, { store: casStore(), cost: 0 }), TypeError);
+});
+
+test('toWebHandler: the limiter keys on context.ip; a caller-sent x-nf-client-connection-ip is replaced', async () => {
+  _resetRateLimit();
+  const seen = [];
+  const inner = createHandler({ rateLimit: { max: 1, windowMs: 60_000 }, handle: async (e) => { seen.push(e.headers['x-nf-client-connection-ip']); return ok({}); } });
+  const h = toWebHandler(inner);
+  const req = (spoof) => new Request('https://x.test/fn', { headers: { 'x-nf-client-connection-ip': spoof } });
+  assert.equal((await h(req('10.0.0.1'), { ip: '9.9.9.1' })).status, 200);
+  assert.equal((await h(req('10.0.0.2'), { ip: '9.9.9.1' })).status, 429, 'rotating the spoofed header must not mint a bucket');
+  assert.deepEqual(seen, ['9.9.9.1']);
+  const ev = await toLambdaEvent(req('10.0.0.3'), {});
+  assert.equal(ev.headers['x-nf-client-connection-ip'], undefined, 'no context.ip: the spoofed value is dropped, not kept');
+});
+
+test('toWebHandler: query and headers are own data; repeated keys join; rawQuery and binary bodies match the classic event', async () => {
+  const ev = await toLambdaEvent(new Request('https://x.test/f?constructor=1&__proto__=2&id=!!&id=ok', {
+    method: 'POST', headers: { 'content-type': 'application/octet-stream', __proto__x: 'y' }, body: new Uint8Array([0, 255]) }), {});
+  assert.equal(ev.queryStringParameters.constructor, '1');
+  assert.equal(Object.getOwnPropertyDescriptor(ev.queryStringParameters, '__proto__').value, '2');
+  assert.equal(ev.queryStringParameters.id, '!!, ok');
+  assert.deepEqual(ev.multiValueQueryStringParameters.id, ['!!', 'ok']);
+  assert.equal(ev.rawQuery, 'constructor=1&__proto__=2&id=!!&id=ok');
+  assert.equal(ev.isBase64Encoded, true);
+  assert.equal(ev.body, Buffer.from([0, 255]).toString('base64'));
+  assert.equal(ev.headers.host, 'x.test');
+  const text = await toLambdaEvent(new Request('https://x.test/f', { method: 'POST', body: '{"a":1}', headers: { 'content-type': 'application/json' } }), {});
+  assert.equal(text.body, '{"a":1}'); assert.equal(text.isBase64Encoded, false);
+  assert.equal((await toLambdaEvent(new Request('https://x.test/f'), {})).body, null);
+});
+
+test('toWebHandler: a throw is a bare no-store 500 that says nothing of the error; HEAD and 204 send no body; headers ride every answer', async () => {
+  const err = console.error; const logged = [];
+  console.error = (...a) => logged.push(a.join(' '));
+  try {
+    const r = await toWebHandler(async () => { throw new Error('secret /var/task/x.js'); })(new Request('https://x.test/f'), {});
+    assert.equal(r.status, 500);
+    const body = await r.text();
+    assert.deepEqual(JSON.parse(body), { error: 'Internal error' });
+    assert.ok(!body.includes('secret'));
+    assert.equal(r.headers.get('cache-control'), 'no-store');
+    assert.equal(r.headers.get('access-control-allow-origin'), '*');
+    assert.equal(r.headers.get('content-security-policy'), CSP);
+    assert.equal((await toWebHandler(async () => { throw new Error('x'); }, { cors: false })(new Request('https://x.test/f'), {})).headers.get('access-control-allow-origin'), null);
+    assert.ok(logged.length >= 2);
+  } finally { console.error = err; }
+  const h = toWebHandler(async () => ({ statusCode: 200, headers: { 'content-type': 'text/plain' }, multiValueHeaders: { 'set-cookie': ['a=1', 'b=2'] }, body: 'hello' }));
+  const head = await h(new Request('https://x.test/f', { method: 'HEAD' }), {});
+  assert.equal(await head.text(), '');
+  const get = await h(new Request('https://x.test/f'), {});
+  assert.equal(await get.text(), 'hello');
+  assert.equal(get.headers.get('referrer-policy'), 'no-referrer');
+  assert.deepEqual(get.headers.getSetCookie(), ['a=1', 'b=2']);
+  const nc = toWebResponse({ statusCode: 204, headers: {}, body: 'ignored' }, 'GET');
+  assert.equal(nc.status, 204); assert.equal(await nc.text(), '');
+  assert.throws(() => toWebHandler('nope'), TypeError);
 });

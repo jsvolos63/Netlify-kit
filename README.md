@@ -69,6 +69,17 @@ export const handler = createHandler({
 **CORS** — `corsHeaders` (object), `handlePreflight(event)` (204 for OPTIONS,
 else `null`), `preflightResponse(opts)` (unconditional 204 advertising verbs).
 
+**API response headers** (0.11.0, NK-6) — `API_RESPONSE_HEADERS`:
+`X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src
+'none'; frame-ancestors 'none'; sandbox`, `Referrer-Policy: no-referrer`.
+Netlify never applies `netlify.toml`'s `[[headers]]` to a function's response,
+so these ride on **every** shape the kit builds: every responder below, every
+`createHandler` short-circuit (preflight, 405, 413, 414, 429, 500), whatever
+`handle` / `onError` return, and every `toWebHandler` answer. A header the
+response already sets is never overwritten (case-insensitive), so a function
+with its own CSP stays the authority. `addApiHeaders(response)` applies them to
+a hand-built Lambda-shaped response (returns a new object).
+
 **Responses**
 - `JSON_HEADERS` — `Content-Type: application/json; charset=utf-8` + CORS.
 - `jsonBodyResponse(body, cacheControl?, extraHeaders?)` — 200, no
@@ -93,8 +104,14 @@ else `null`), `preflightResponse(opts)` (unconditional 204 advertising verbs).
   `textResponse` forms still honor an explicit per-call `opts.corsOrigin`.
 - `errorMessage(err, max=200)` — bounded stringification.
 - `checkResponseSize(response, headers?)` — pre-read 502 guard from
-  `content-length`. `readTextCapped(res, maxBytes)` — streamed UTF-8 read that
-  throws `.tooLarge` past the cap. `MAX_RESPONSE_BYTES` (5 MB).
+  `content-length`. **Not a cap on its own** (FAM-8): a chunked upstream sends
+  no length, passes it, and a following `response.text()` / `.json()` buffers
+  everything. `readTextCapped(res, maxBytes = MAX_RESPONSE_BYTES)` — streamed
+  UTF-8 read that throws `.tooLarge` past the cap; since 0.11.0 an omitted cap
+  means 5 MB (it used to mean none) and a cap that is not a non-negative finite
+  number throws `TypeError`. `readJsonCapped(res, maxBytes?)` — the capped
+  `response.json()`; a non-JSON body throws `.notJson`. `MAX_RESPONSE_BYTES`
+  (5 MB).
 
 **Validation** — `SYMBOL_RE`, `FRED_ID_RE`, `UNIX_TS_RE`, `isValidDate`,
 `isValidTimestamp`.
@@ -151,11 +168,31 @@ injectable `fetchFn`/`sleepFn`/`rng`), `RETRYABLE_STATUSES`.
   the pattern Weather's nowcast/airnow and Art-Gallery-'s proxy already use.
 
 **Rate limiting**
+
+> **The in-memory limiter is per container and is not a cost control
+> (FAM-3).** Netlify spreads concurrent requests over containers: measured
+> 2026-09-26, 90 parallel requests to a 60/min endpoint drew zero 429s. It
+> slows a single sequential client and nothing else. An endpoint that spends
+> a key, a quota or money wants the distributed limiter **and** a global
+> `spendDailyBudget` on the upstream it calls.
+
 - `checkRateLimit(event, max, windowMs, opts?)` / `checkRateLimitDistributed(...)`
   (async, Netlify Blobs with in-memory fallback) — return a ready 429/414
   response or `null`. `opts.cors: false` strips the `Access-Control-*` headers
   off the 429/414 shapes (matching `createResponders`); `Retry-After` and
-  `nosniff` survive. `_resetStoreCache()` test seam. `MAX_QUERY_LENGTH`.
+  `nosniff` survive. `MAX_QUERY_LENGTH`.
+  - `opts.namespace` (0.11.0, NK-5) — `[A-Za-z0-9_.-]{1,64}`; the bucket key
+    becomes `rl:${namespace}:${ip}:${window}`. Omitted → the old shared
+    `rl:${ip}:${window}`, the same bucket for every endpoint that omits it.
+  - The Blobs store is opened on **every** call (0.11.0): a modern function's
+    Blobs token is per invocation, and the old container-lifetime cache kept a
+    warm instance on the first invocation's token after it lapsed.
+  - `_resetStoreCache()` / `_setBlobsModuleForTest(mod)` test seams.
+- `spendDailyBudget(name, max, { now?, cost?, store?, failOpen?, retries? })`
+  (async, 0.11.0) — a **global** per-UTC-day ceiling for a billed or keyed
+  upstream, counted across every caller and container with the limiter's
+  compare-and-set; resolves `{ ok, used, max, resetAt, reason? }`. Fails
+  **closed** (`reason: 'unavailable'`) when Blobs is down unless `failOpen`.
 - `rateLimit(event, { name, windowMs, max })` → `{ ok, retryAfter }` low-level
   check. `clientIp(event)`. `_resetRateLimit()` test seam.
 
@@ -178,6 +215,13 @@ distributed limiter) and no-op on failure (a null store reads as a miss).
 **Handler** — `createHandler({ name, methods, maxBodyBytes, rateLimit,
 distributed, cors, handle, onError })`.
 
+- `distributed: true` namespaces its bucket by `rateLimit.namespace`, else by
+  `name` (0.11.0, NK-5), so two endpoints no longer spend one bucket; give
+  them the same `namespace` to share one on purpose. The namespace must be a
+  valid key part, checked when the handler is built.
+- Whatever `handle` / `onError` return gets the API response headers where
+  absent (0.11.0).
+
 - `methods` (0.10.0, optional) — array of allowed HTTP methods, e.g.
   `['GET', 'HEAD']`, matched case-insensitively. Anything else is refused with
   a 405 carrying an `Allow` header listing exactly these methods, **before**
@@ -193,6 +237,23 @@ distributed, cors, handle, onError })`.
   413, the limiter's 429/414 plus the catch-all 500 use the no-CORS shapes —
   pair it with `createResponders({ cors: false })` inside `handle` for a fully
   CORS-free endpoint.
+
+**Modern (web-Request) functions** (0.11.0) — `toWebHandler(handler, { cors? })`
+serves any Lambda-shaped handler (createHandler's included) as a modern
+function's default export: `export default toWebHandler(handler)`. Only a
+modern function gets a per-invocation Blobs context (so the distributed limiter
+and `spendDailyBudget` work) and only a modern function can carry an edge
+`config.rateLimit`. It replaces five drifted consumer adapters and is
+FlightCheck's `toV2`, in production since 2026-09-23: the limiter keys on the
+runtime's `context.ip` and a caller-sent `x-nf-client-connection-ip` is deleted
+first (NK-2: one consumer's copy kept it, so a rotating spoofed value minted a
+fresh bucket per request); query and header maps are own data (`?constructor=1`
+is a value, not a prototype lookup); a repeated key joins with `, `; `rawQuery`
+is filled; binary bodies arrive base64; a throw is a bare no-store
+`500 {"error":"Internal error"}` that says nothing of the error; HEAD and
+101/204/205/304 send no body; `multiValueHeaders` win; every answer carries the
+API headers. Its halves are exported as `toLambdaEvent(request, context)` and
+`toWebResponse(result, method)`.
 
 **Anthropic (Claude) client — retained, unused since 2026-09-30.** No consumer
 calls it: Surf-Tracker removed its AI summaries and market-monitor its Claude
